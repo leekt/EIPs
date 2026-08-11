@@ -1,0 +1,30 @@
+name: Fix EIP-8141 eipw links
+
+on:
+  push:
+    branches:
+      - agent/tmp-eip8141-eipw-links
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Apply eipw cleanup
+        run: python scripts/fix_eip8141_eipw_links.py
+
+      - name: Commit EIP update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add EIPS/eip-8141.md
+          git commit -m "docs: satisfy eipw link and wording checks"
+          git push origin "HEAD:${{ github.ref_name }}"
