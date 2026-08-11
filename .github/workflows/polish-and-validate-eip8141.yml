@@ -1,0 +1,50 @@
+name: Polish and validate EIP-8141
+
+on:
+  push:
+    branches:
+      - agent/tmp-eip-8141-root-registry-build
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply final wording polish
+        run: python3 .github/scripts/polish_eip8141_registered_root.py
+
+      - name: Validate focused diff
+        run: |
+          git diff --check
+          test "$(git diff --name-only | tr '\n' ' ')" = "EIPS/eip-8141.md "
+          grep -q 'otherwise independent' EIPS/eip-8141.md
+          grep -q 'registered-static equivalent' EIPS/eip-8141.md
+          ! grep -q 'existing this EIP' EIPS/eip-8141.md
+
+      - name: Merge EIP and ERC repositories for validation
+        uses: ./.github/actions/merge-repos
+
+      - name: Run EIP validator
+        uses: ethereum/eipw-action@b858a0f2687c12af12280aa934c3b842747414fd
+        with:
+          token: ${{ github.token }}
+          unchecked: 1, 5069, 5757
+          options-file: config/eipw.toml
+          include: EIPS/**
+
+      - name: Commit polished specification
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/scripts/polish_eip8141_registered_root.py
+          git rm .github/workflows/polish-and-validate-eip8141.yml
+          git add EIPS/eip-8141.md
+          git commit -m 'docs: polish registered root key wording'
+          git push
