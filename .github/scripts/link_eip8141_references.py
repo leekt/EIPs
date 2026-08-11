@@ -15,7 +15,7 @@ def replace_once(old: str, new: str) -> None:
     text = text.replace(old, new, 1)
 
 
-# Avoid self-links and keep the prose natural.
+# Avoid self-links and keep common self-references natural.
 replace_once(
     "EIP-8141 defines a canonical state-backed root-key registry.",
     "This EIP defines a canonical state-backed root-key registry.",
@@ -50,7 +50,7 @@ def link_plain(segment: str) -> str:
         kind = match.group(1).upper()
         number = match.group(2)
         if number == "8141":
-            raise RuntimeError(f"unhandled self-reference in prose: {match.group(0)!r}")
+            return "this EIP"
         return f"[{kind}-{number}](./eip-{number}.md)"
 
     return REFERENCE.sub(repl, segment)
@@ -83,6 +83,7 @@ if in_fence:
     raise RuntimeError("unclosed fenced code block")
 
 text = "".join(output)
+text = re.sub(r"(?m)^this EIP", "This EIP", text)
 
 # Detect any remaining plain references outside code, headings, and inline code.
 remaining: list[str] = []
