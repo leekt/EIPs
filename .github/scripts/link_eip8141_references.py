@@ -29,8 +29,8 @@ replace_once(
     "The registry is defined directly in this EIP",
 )
 
-REFERENCE = re.compile(r"(?<![\\[/])\\b(EIP|ERC)-(\\d+)\\b", re.IGNORECASE)
-LINK = re.compile(r"\\[[^\\]]*\\]\\([^)]*\\)")
+REFERENCE = re.compile(r"(?<![\[/])\b(EIP|ERC)-(\d+)\b", re.IGNORECASE)
+LINK = re.compile(r"\[[^\]]*\]\([^)]*\)")
 
 
 def link_segment(segment: str) -> str:
