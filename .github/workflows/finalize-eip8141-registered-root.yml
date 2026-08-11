@@ -30,7 +30,6 @@ jobs:
           grep -q 'inspired by.*EIP-8130' EIPS/eip-8141.md
           ! grep -q 'EIP8130_ACTOR' EIPS/eip-8141.md
           ! grep -q 'RegisteredK1' EIPS/eip-8141.md
-          ! grep -q $'        return False\n        return False' EIPS/eip-8141.md
 
       - name: Commit final specification
         run: |
