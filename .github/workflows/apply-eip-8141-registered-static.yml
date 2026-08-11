@@ -1,0 +1,193 @@
+name: Apply EIP-8141 registered-static VERIFY patch
+
+on:
+  push:
+    branches:
+      - agent/eip-8141-registered-static-verify
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/eip-8141-registered-static-verify
+
+      - name: Apply focused specification edits
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("EIPS/eip-8141.md")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"expected one match, found {count}: {old[:120]!r}")
+              text = text.replace(old, new, 1)
+
+          def sub_once(pattern: str, replacement: str) -> None:
+              global text
+              text, count = re.subn(pattern, replacement, text, count=1, flags=re.DOTALL)
+              if count != 1:
+                  raise RuntimeError(f"expected one regex match, found {count}: {pattern[:120]!r}")
+
+          replace_once(
+              "After native authentication, the protocol reads exactly one EIP-8130 configuration slot at `ACCOUNT_CONFIG_ADDRESS`. It applies EIP-8130's native secp256k1 self-actor rule when applicable; every other actor uses `actor_config(resolved_signer, actor_id)`. Validation returns and caches `actor_id`, `scope`, `expiry`, and the exact 32-byte storage slot read. This proves only that the actor is registered and live; it does not grant any frame context. Default code applies the cached scope to the requested approval context. The slot is used consistently for gas accounting and mempool revalidation.",
+              "After native authentication, the protocol reads exactly one EIP-8130 configuration slot at `ACCOUNT_CONFIG_ADDRESS`. It applies EIP-8130's native secp256k1 self-actor rule when applicable; every other actor uses `actor_config(resolved_signer, actor_id)`. Validation returns and caches `actor_id`, `scope`, `expiry`, and the exact 32-byte storage slot read. This proves that the account registered a live actor and supplies the authorization metadata consumed by the protocol-defined registered-static `VERIFY` path below. The slot is used consistently for approval, gas accounting, and mempool revalidation."
+          )
+
+          marker = "#### Expiry Verifier Frame\n"
+          registered_static_section = r'''#### Registered-static VERIFY frame
+
+An `EIP8130_ACTOR` signature can be consumed directly by a `VERIFY` frame without loading or executing the resolved target's account code. This is a protocol-defined execution path, not merely an implementation optimization. Clients MUST determine whether this path applies before inspecting the resolved target's code hash, so it works identically for empty-code accounts, deployed smart accounts, and accounts using an EIP-7702 delegation indicator. Registering the actor and its scope in `ACCOUNT_CONFIG_ADDRESS` is the account's opt-in to this path.
+
+For a `VERIFY` frame, let:
+
+```python
+allowed_scope = frame.flags & APPROVE_SCOPE_MASK
+sig_index = 0 if allowed_scope & APPROVE_EXECUTION else 1
+```
+
+If `allowed_scope == APPROVE_SCOPE_NONE`, if no signature exists at `sig_index`, or if the selected signature's scheme is not `EIP8130_ACTOR`, this is not a registered-static frame and ordinary frame execution continues.
+
+If the selected signature's scheme is `EIP8130_ACTOR`, the frame is a registered-static frame and MUST satisfy all of the following:
+
+- `frame.data == Bytes()`;
+- the signature's `resolved_signer` equals `resolved_target`;
+- `sig.msg == Bytes()`, so the signature commits to the canonical transaction hash and the complete frame list;
+- the selected signature has a cached `ActorValidation` result;
+- the cached actor scope does not contain `EIP8130_SCOPE_POLICY`;
+- if execution approval is requested, the actor scope is zero or contains `EIP8130_SCOPE_SENDER`;
+- if payment approval is requested for `tx.sender`, the actor scope is zero or contains `EIP8130_SCOPE_SELF_PAYER`; and
+- if payment approval is requested for an account other than `tx.sender`, the actor scope is zero or contains `EIP8130_SCOPE_SPONSOR_PAYER`.
+
+If any requirement fails, the `VERIFY` frame reverts and the transaction is invalid. Otherwise the client applies exactly the same transaction-context checks and effects as if `resolved_target` had executed `APPROVE(allowed_scope)`, then completes the frame successfully with empty return data and no logs. The target account's code hash, implementation, proxy, modules, and nonce lanes are not read or executed.
+
+The cryptographic verification and exact registry-slot access are charged as part of `signature_verification_cost`. The registered-static frame itself consumes no frame gas beyond the existing per-frame transaction cost, so its entire `gas_limit` is unused and refunded under the ordinary frame gas accounting rules.
+
+'''
+          replace_once(marker, registered_static_section + marker)
+
+          replace_once(
+              "    - If `resolved_target` code hash is empty, i.e. `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`, execute the logic described in [default code](#default-code).\n        - Otherwise, if `resolved_target` uses an [EIP-7702](./eip-7702.md) delegation indicator, execute according to [EIP-7702](./eip-7702.md)'s delegated-code semantics.",
+              "    - If the frame is a [registered-static VERIFY frame](#registered-static-verify-frame), execute its protocol-defined approval behavior and skip all target account code lookup and execution.\n    - Otherwise, if `resolved_target` code hash is empty, i.e. `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`, execute the logic described in [default code](#default-code).\n    - Otherwise, if `resolved_target` uses an [EIP-7702](./eip-7702.md) delegation indicator, execute according to [EIP-7702](./eip-7702.md)'s delegated-code semantics."
+          )
+
+          new_default_code = r'''##### Default code
+
+Frame transactions can be used by accounts who do not have deployed code, nor an [EIP-7702](./eip-7702.md) delegation indicator via the "default code" mechanism. The behavior of the default code is defined below:
+
+- If `mode` is `VERIFY`:
+  - Read the allowed approval scope from the flags field: `allowed_scope = frame.flags & APPROVE_SCOPE_MASK`.
+  - If `allowed_scope == APPROVE_SCOPE_NONE`, revert.
+  - Let `sig_index = 0` if `allowed_scope & APPROVE_EXECUTION != 0`, else `sig_index = 1`.
+  - If no signature exists at `sig_index`, revert. Let `sig` be that signature; the default code does not scan other indices.
+  - Require `resolved_signer == resolved_target` and `sig.msg == Bytes()`.
+  - Require `sig.scheme == SECP256K1`.
+  - Call `APPROVE(allowed_scope)`.
+- If `mode` is `SENDER` or `DEFAULT`:
+  - Return successfully as if calling empty code.
+
+The empty-`msg` requirement is unconditional for default code: an explicit digest does not commit to the frame list and can never authorize execution or payment here. An `EIP8130_ACTOR` signature is consumed by the registered-static path before default-code dispatch, including when the target has empty code. Accounts that need policy execution or an unsupported authenticator must deploy or delegate validation code and use an ordinary `VERIFY` frame.
+
+### `APPROVE` Instruction (`0xaa`)'''
+          sub_once(
+              r"##### Default code\n\n.*?\n### `APPROVE` Instruction \(`0xaa`\)",
+              new_default_code
+          )
+
+          replace_once(
+              "3. `self_verify` and `only_verify` must execute in `VERIFY` mode, target `tx.sender` (either explicitly or via a null target), must successfully call `APPROVE`, and `frame.flags` must match the scope of the `APPROVE` call.",
+              "3. `self_verify` and `only_verify` must execute in `VERIFY` mode, target `tx.sender` (either explicitly or via a null target), and must either successfully call `APPROVE` or complete through registered-static evaluation with the equivalent approval effects. `frame.flags` must match the approved scope."
+          )
+          replace_once(
+              "9. Every `EIP8130_ACTOR` entry must have empty `msg` and must be the signature at the deterministic index selected by a default-code `VERIFY` frame in the validation prefix. Reject unused entries, entries consumed only outside the validation prefix, and explicit-message entries.",
+              "9. Every `EIP8130_ACTOR` entry must have empty `msg` and must be the signature at the deterministic index selected by a registered-static `VERIFY` frame in the validation prefix. Reject unused entries, entries consumed only outside the validation prefix, and explicit-message entries."
+          )
+
+          replace_once(
+              "Three frame species in the validation prefix have fully protocol-defined semantics, leaving no deployed code whose behavior a node would need to discover by execution: a frame whose resolved target has the empty code hash (default code), an expiry verifier frame whose runtime code at `EXPIRY_VERIFIER` matches the canonical expiry verifier code, and a `pay` frame admitted by canonical paymaster code match per the previous section.",
+              "Four frame species in the validation prefix have fully protocol-defined semantics, leaving no deployed account validation code whose behavior a node would need to discover by execution: a registered-static `VERIFY` frame, a frame whose resolved target has the empty code hash (default code), an expiry verifier frame whose runtime code at `EXPIRY_VERIFIER` matches the canonical expiry verifier code, and a `pay` frame admitted by canonical paymaster code match per the previous section. Registered-static dispatch is selected from the signature scheme before account-code lookup, so the target's deployed or delegated code is not a validation dependency."
+          )
+
+          replace_once(
+              "2. The node performs all stateless transaction and signature-shape checks, analyzes the frame structure, and determines the validation prefix. If the prefix is not recognized, reject. For every `EIP8130_ACTOR` entry, also require empty `msg` and a candidate default-code `VERIFY` frame in the prefix that selects its deterministic signature index.",
+              "2. The node performs all stateless transaction and signature-shape checks, analyzes the frame structure, and determines the validation prefix. If the prefix is not recognized, reject. For every `EIP8130_ACTOR` entry, also require empty `msg` and a candidate registered-static `VERIFY` frame in the prefix that selects its deterministic signature index."
+          )
+          replace_once(
+              "4. The node simulates the validation prefix and enforces the structural and trace rules above, except that a `pay` frame whose target runtime code exactly matches the canonical paymaster implementation is handled via the canonical paymaster exception and the paymaster-specific rules below. Confirm that every `EIP8130_ACTOR` entry was actually consumed by default code; otherwise reject.",
+              "4. The node simulates the validation prefix or directly evaluates its protocol-defined frames and enforces the structural and trace rules above. A registered-static `VERIFY` frame is evaluated without account-code execution, and a `pay` frame whose target runtime code exactly matches the canonical paymaster implementation is handled via the canonical paymaster exception and the paymaster-specific rules below. Confirm that every `EIP8130_ACTOR` entry was actually consumed by registered-static evaluation; otherwise reject."
+          )
+          replace_once(
+              "6. For every `EIP8130_ACTOR` entry, the node enforces the empty-message and default-code-consumption rule, records its exact actor-validation storage key and expiry, and enforces `MAX_PENDING_TXS_PER_ACTOR_SLOT`.",
+              "6. For every `EIP8130_ACTOR` entry, the node enforces the empty-message and registered-static-consumption rule, records its exact actor-validation storage key and expiry, and enforces `MAX_PENDING_TXS_PER_ACTOR_SLOT`."
+          )
+
+          new_rationale = r'''### EIP-8130 actor fast path
+
+`EIP8130_ACTOR` lets an account with or without deployed code opt into a registered-static root-key path using EIP-8130's canonical account configuration. The registry entry is the source of truth for whether an actor is live, which authenticator it uses, its scope, and its expiry. Native secp256k1 or P256 verification plus one exactly identified configuration read replaces discovery and execution of proxy, implementation, module, and nonce-lane logic.
+
+A matching `VERIFY` frame is dispatched before target account-code lookup and applies the normal `APPROVE` effects directly. This preserves the EIP-8141 frame interface and approval scopes while giving sequencers and public mempools bounded validation work. The signature entry does not approve anything merely by existing; the deterministic `VERIFY` frame selects the signature and the requested scope.
+
+The consensus surface is deliberately smaller than EIP-8130's extensible authenticator model. A transaction cannot select a registry, clients never execute authenticator code during outer-signature validation, and only native secp256k1 and enshrined P256 are recognized. This makes validation exactly one fixed-cost cryptographic operation plus one exactly identified configuration SLOAD. Passkey, delegate, custom, and future authenticators stay in ordinary `VERIFY` frames until a separate proposal defines fixed byte-level and gas semantics for another native fast path.
+
+For P256, the transaction still carries `qx` and `qy`; the registry binds their `keccak256` actor identifier and authenticator rather than duplicating the full public key. The actor result is cached only for protocol-defined consumers. Avoiding a new EVM-visible actor ABI keeps the fast path from becoming a generic authorization primitive and leaves custom account policy in ordinary `VERIFY` code.
+
+### Externally Owned Account (EOA) support'''
+          sub_once(
+              r"### EIP-8130 actor fast path\n\n.*?\n### Externally Owned Account \(EOA\) support",
+              new_rationale
+          )
+
+          replace_once(
+              "Frame 0 uses a signature entry with empty `msg` for the sender and calls `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)` to approve both payment and execution. Frame 1 executes and exits normally via `RETURN`.",
+              "Frame 0 uses a signature entry with empty `msg` for the sender and approves both payment and execution. With `SECP256K1`, default or account code calls `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)`. With `EIP8130_ACTOR`, the same frame is evaluated through the registered-static path and applies the equivalent approval effects even when the sender has deployed smart-account code. Frame 1 executes and exits normally via `RETURN`."
+          )
+
+          replace_once(
+              "An `EIP8130_ACTOR` entry makes transaction validity depend on one slot in the canonical Account Configuration Contract. The exact storage key returned by validation prevents unrelated actors or adjacent configuration state from becoming dependencies. It does not by itself bound fanout: one actor could sign for many senders and revoke that one slot. The public-mempool per-slot limit bounds this invalidation set, while exact-key indexing identifies the transactions that require revalidation. Requiring every propagated entry to have empty `msg` and be consumed by default code prevents a reusable explicit-digest signature from being attached as an unused dependency to poison the slot reservation.",
+              "An `EIP8130_ACTOR` entry makes transaction validity depend on one slot in the canonical Account Configuration Contract. The exact storage key returned by validation prevents unrelated actors or adjacent configuration state from becoming dependencies. It does not by itself bound fanout: one actor could sign for many senders and revoke that one slot. The public-mempool per-slot limit bounds this invalidation set, while exact-key indexing identifies the transactions that require revalidation. Requiring every propagated entry to have empty `msg` and be consumed by a registered-static `VERIFY` frame prevents a reusable explicit-digest signature from being attached as an unused dependency to poison the slot reservation."
+          )
+          replace_once(
+              "Actor configuration is read at inclusion time. A configuration change after signing invalidates the transaction, as does passage beyond a nonzero actor expiry. The authenticator selector remains in `compute_sig_hash(tx)` for empty-message signatures, so a witness cannot be transplanted between the K1 and P256 validation rules. Default code additionally requires an empty message and rejects every `POLICY` actor, preventing an explicit-digest replay or bypass of EIP-8130's manager gate.",
+              "Actor configuration is read at inclusion time. A configuration change after signing invalidates the transaction, as does passage beyond a nonzero actor expiry. The authenticator selector remains in `compute_sig_hash(tx)` for empty-message signatures, so a witness cannot be transplanted between the K1 and P256 validation rules. Registered-static evaluation additionally requires an empty message and rejects every `POLICY` actor, preventing an explicit-digest replay or bypass of EIP-8130's manager gate."
+          )
+
+          mitigation_marker = "##### Mitigations\n"
+          bypass_security = r'''#### Registered-static validation bypasses account code
+
+Registered-static evaluation intentionally does not execute the target account's validation code. An account that registers an actor with sender or payer scope is therefore granting that actor direct root authority for the corresponding EIP-8141 approval. Wallets MUST NOT expect multisig thresholds, session-key limits, validator-module routing, spending policies, or nonce-lane logic in account code to run on this path.
+
+Accounts should register only credentials whose configured scope may safely bypass those policies. Transactions requiring account-specific policy must use an ordinary code-executing `VERIFY` frame and an `ARBITRARY` or separately supported signature path. Revoking or narrowing the registry entry disables or restricts subsequent registered-static transactions and causes affected pending transactions to be revalidated.
+
+'''
+          replace_once(mitigation_marker, bypass_security + mitigation_marker)
+
+          path.write_text(text)
+          PY
+
+      - name: Validate patch shape
+        shell: bash
+        run: |
+          git diff --check
+          grep -q '^#### Registered-static VERIFY frame$' EIPS/eip-8141.md
+          grep -q 'skip all target account code lookup and execution' EIPS/eip-8141.md
+          test "$(git diff --name-only | tr -d '\r')" = "EIPS/eip-8141.md"
+
+      - name: Commit specification update
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add EIPS/eip-8141.md
+          git commit -m "docs: add registered-static VERIFY path"
+          git push origin HEAD:agent/eip-8141-registered-static-verify
