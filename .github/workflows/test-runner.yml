@@ -1,0 +1,16 @@
+name: Test workflow runner
+
+on:
+  push:
+    branches:
+      - agent/eip-8141-registered-static-verify
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo
+        run: echo runner-ok
