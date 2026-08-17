@@ -2,22 +2,17 @@
 pragma solidity ^0.8.24;
 
 /// @notice Minimal canonical paymaster for EIP-8141-style frame transactions.
-/// @dev VERIFY frame calldata is expected to be exactly:
-///      r (32 bytes) || s (32 bytes) || v (1 byte)
-///      The signature is checked against TXPARAM(0x08), i.e. the canonical tx sig hash.
-///      On success, the contract calls APPROVE with scope=0x1 and offset/length=0 to approve payment.
-///      This implementation supports only a single secp256k1 signer recovered via ecrecover.
-///      ERC-1271 and other contract-signature schemes are not supported.
+/// @dev The PAY/VERIFY frame must carry empty calldata and exactly one
+///      frame-scoped signature reference. Local signature index 0 must resolve
+///      to a protocol-validated SECP256K1 signature with empty msg and signer
+///      equal to owner. The protocol validates the raw signature before frame
+///      execution, so this contract checks only frame-local signature metadata.
 contract CanonicalPaymaster {
     uint256 public constant WITHDRAWAL_DELAY = 12 hours;
-
-    // secp256k1n / 2
-    uint256 private constant SECP256K1N_DIV_2 =
-        0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
+    uint256 private constant SECP256K1_SCHEME = 0x01;
 
     // Stored in contract storage instead of immutable so the deployed runtime code
     // is identical across all instances and can be recognized canonically by code match.
-    // This is the authorized secp256k1 signer address, not a generic contract-signature authority.
     address public owner;
 
     address payable public pendingWithdrawalTo;
@@ -26,7 +21,7 @@ contract CanonicalPaymaster {
 
     error NotOwner();
     error ZeroAddress();
-    error InvalidSignature();
+    error InvalidSignatureReference();
     error NoPendingWithdrawal();
     error WithdrawalNotReady();
     error TransferFailed();
@@ -41,26 +36,23 @@ contract CanonicalPaymaster {
 
     receive() external payable {}
 
-    /// @dev Raw paymaster validation entrypoint.
-    ///      Use as the target of the PAY/VERIFY frame.
+    /// @dev Raw paymaster validation entrypoint. Use as the target of the PAY/VERIFY frame.
     fallback() external payable {
-        if (msg.data.length != 65) revert InvalidSignature();
+        if (msg.data.length != 0) revert InvalidSignatureReference();
+        if (_signatureRefCount() != 1) revert InvalidSignatureReference();
 
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-
-        assembly {
-            r := calldataload(0x00)
-            s := calldataload(0x20)
-            v := byte(0, calldataload(0x40))
+        uint256 localSignatureIndex = 0;
+        if (_signatureScheme(localSignatureIndex) != SECP256K1_SCHEME) {
+            revert InvalidSignatureReference();
         }
-
-        if (uint256(s) > SECP256K1N_DIV_2) revert InvalidSignature();
-        if (v != 27 && v != 28) revert InvalidSignature();
-
-        if (ecrecover(_txSigHash(), v, r, s) != owner) {
-            revert InvalidSignature();
+        if (_signatureSigner(localSignatureIndex) != owner) {
+            revert InvalidSignatureReference();
+        }
+        if (_signatureMessage(localSignatureIndex) != bytes32(0)) {
+            revert InvalidSignatureReference();
+        }
+        if (_signatureLength(localSignatureIndex) != 65) {
+            revert InvalidSignatureReference();
         }
 
         _approvePayer();
@@ -97,10 +89,43 @@ contract CanonicalPaymaster {
         emit WithdrawalExecuted(to, amount);
     }
 
-    function _txSigHash() internal returns (bytes32 sigHash) {
+    function _signatureRefCount() internal returns (uint256 count) {
+        uint256 frameIndex;
         assembly {
-            // TXPARAM(0x08) -> canonical frame transaction signature hash
-            sigHash := verbatim_0i_1o(hex"6008b0")
+            // TXPARAM(0x0a) -> current frame index
+            frameIndex := verbatim_0i_1o(hex"600ab0")
+            // FRAMEPARAM(param=0x0c, frameIndex) -> len(signature_refs)
+            count := verbatim_1i_1o(hex"600c90b3", frameIndex)
+        }
+    }
+
+    function _signatureSigner(uint256 localSignatureIndex) internal returns (address signer) {
+        uint256 value;
+        assembly {
+            // SIGPARAM(param=0, localSignatureIndex)
+            value := verbatim_1i_1o(hex"600090b4", localSignatureIndex)
+        }
+        signer = address(uint160(value));
+    }
+
+    function _signatureScheme(uint256 localSignatureIndex) internal returns (uint256 scheme) {
+        assembly {
+            // SIGPARAM(param=1, localSignatureIndex)
+            scheme := verbatim_1i_1o(hex"600190b4", localSignatureIndex)
+        }
+    }
+
+    function _signatureMessage(uint256 localSignatureIndex) internal returns (bytes32 message) {
+        assembly {
+            // SIGPARAM(param=2, localSignatureIndex); zero represents empty msg.
+            message := verbatim_1i_1o(hex"600290b4", localSignatureIndex)
+        }
+    }
+
+    function _signatureLength(uint256 localSignatureIndex) internal returns (uint256 length) {
+        assembly {
+            // SIGPARAM(param=3, localSignatureIndex)
+            length := verbatim_1i_1o(hex"600390b4", localSignatureIndex)
         }
     }
 
