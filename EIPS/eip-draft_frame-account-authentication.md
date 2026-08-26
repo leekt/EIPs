@@ -157,7 +157,7 @@ def validate_authenticator(sig, sig_hash, state):
 
 EIP-8141's `compute_sig_hash` is not modified. For a canonical-hash `AUTHENTICATOR` entry the entire `signature` field is elided exactly like every other EIP-8141 witness, so `key_id` and `proof` are replaceable witness data. The integrity of `key_id` comes from the authenticator result plus the protocol equality check, not from inclusion in the canonical hash. Once validation succeeds, `key_id` may be treated as authenticated metadata.
 
-`AUTHENTICATOR` is an opaque protocol-validated scheme like `SECP256K1` and `P256`: `SIGDATACOPY` and `SIGPARAM(0x03)` are not defined for it and result in an exceptional halt. No `SIGPARAM` value exposes `key_id`. Builders, sequencers, and other off-chain consumers read `key_id` from the transaction object directly.
+For `AUTHENTICATOR` entries, EIP-8141's existing `SIGDATACOPY` instruction is defined over the full raw `signature` bytes (`key_id || proof`) with the same copy semantics and gas cost. Account code MAY therefore read the first 32 bytes as the authenticated `key_id` when it needs per-key policy; doing so is optional and does not change the default authenticator-level authorization model.
 
 There is no fallback from `AUTHENTICATOR` to `ARBITRARY`, account-code signature verification, or another signature scheme.
 
@@ -233,7 +233,7 @@ require(isAuthorized[authenticator])
 APPROVE(scope)
 ```
 
-The account does not re-verify or separately authorize `key_id`, and does not parse the proof; those have already been authenticated by the protocol equality check. Authorizing an authenticator delegates credential selection and proof semantics to it (see [Security Considerations](#authenticator-trust-model)). Key rotation policy, recovery, guardians, sessions, locks, storage layout, and wallet presentation are not standardized here; they belong to account implementations or a companion ERC.
+The account does not re-verify `key_id` or parse the proof; those have already been authenticated by the protocol equality check. An account MAY additionally read `key_id` from the first 32 bytes of the signature with `SIGDATACOPY` and apply per-key policy, but this EIP does not require per-key authorization. Authorizing an authenticator without an additional key-level check delegates credential selection and proof semantics to it (see [Security Considerations](#authenticator-trust-model)). Key rotation policy, recovery, guardians, sessions, locks, storage layout, and wallet presentation are not standardized here; they belong to account implementations or a companion ERC.
 
 ### Public mempool
 
@@ -266,25 +266,21 @@ A cache entry keyed without `authenticator_code_hash` may return a result produc
 The scheme separates two operations with different cost and state profiles:
 
 1. Protocol authentication: expensive, state-independent, bounded by `AUTHENTICATOR_GAS_LIMIT`. Resolves `(authenticator, key_id)` cryptographically.
-2. Account authorization: cheap, stateful, account-specific, inside the ordinary `VERIFY` frame. Authorizes the authenticator address.
+2. Account authorization: cheap, stateful, account-specific, inside the ordinary `VERIFY` frame. Authorizes the authenticator address, with optional additional key-level policy chosen by the account.
 
-Responsibilities divide as follows. The protocol executes the bounded authenticator, enforces that the authenticated `key_id` equals the claimed one, and exposes the authenticator as `resolved_signer`. The authenticator owns credential selection, proof semantics, cryptographic verification, and derivation of `key_id`. Builders and sequencers see `(authenticator, key_id)` and may use them for routing, caching, batching, aggregation, or DoS accounting. The account owns authorization policy: it trusts or rejects the authenticator and approves.
+Responsibilities divide as follows. The protocol executes the bounded authenticator, enforces that the authenticated `key_id` equals the claimed one, and exposes the authenticator as `resolved_signer`. The authenticator owns credential selection, proof semantics, cryptographic verification, and derivation of `key_id`. Builders and sequencers see `(authenticator, key_id)` and may use them for routing, caching, batching, aggregation, or DoS accounting. Account code owns authorization policy: it may trust or reject the authenticator alone, or additionally consume authenticated `key_id` through `SIGDATACOPY` for finer-grained policy.
 
 ### Why `signer` is the authenticator
 
-EIP-8141's `signer` identifies the verifying identity of a protocol-validated entry: the recovered address for `SECP256K1`, the public key for `P256`. For `AUTHENTICATOR` the verifying identity is the authenticator contract, so `signer = authenticator` and account code authorizes it through the existing resolved-signer path with no new instruction.
+EIP-8141's `signer` identifies the verifying identity of a protocol-validated entry: the recovered address for `SECP256K1`, the public key for `P256`. For `AUTHENTICATOR` the verifying identity is the authenticator contract, so `signer = authenticator` and account code can authorize it through the existing resolved-signer path with no new instruction.
 
 ### Why the witness carries `key_id`
 
-`key_id` is claimed in the witness so that builders and sequencers can classify authentication work before executing the authenticator: two transactions naming the same `(authenticator, key_id)` are candidates for the same cache line or batch, and a node can account for or rate-limit per credential. Because the value is unsigned witness data, it is only a claim until the authenticator derives the real identifier from the proof and the protocol checks equality. After that check the claim is authenticated, and nothing downstream needs to re-derive it. Account policy does not consume `key_id`; it remains useful to the protocol and to builders even so.
+`key_id` is claimed in the witness so that builders and sequencers can classify authentication work before executing the authenticator: two transactions naming the same `(authenticator, key_id)` are candidates for the same cache line or batch, and a node can account for or rate-limit per credential. Because the value is unsigned witness data, it is only a claim until the authenticator derives the real identifier from the proof and the protocol checks equality. After that check the claim is authenticated, and nothing downstream needs to re-derive it. Account policy need not consume `key_id`, but can read it through `SIGDATACOPY` when per-key policy is useful.
 
-### Why account authorization is authenticator-level
+### Why account authorization is authenticator-level by default
 
-Requiring accounts to authorize `(authenticator, key_id)` pairs would push credential bookkeeping into every account and would require exposing `key_id` to the EVM. Authorizing the authenticator instead lets the authenticator's own semantics — its immutable configuration, its proof format, the credential set it accepts — define which credentials are valid, and lets an account swap or add credentials by pointing at a different authenticator. An account that wants per-credential policy can deploy or configure an authenticator that enforces it.
-
-### Why `AUTHENTICATOR` is opaque to the EVM
-
-EIP-8141 hides the raw bytes of protocol-validated schemes so that future aggregation schemes remain possible. Since account code needs only `SIGPARAM(0x00)` through `SIGPARAM(0x02)`, exposing the `AUTHENTICATOR` witness or `key_id` to the EVM would buy nothing for accounts while unnecessarily closing off aggregation of authenticator proofs. Builders and sequencers, the intended consumers of `key_id`, read the transaction object directly.
+The minimal account path needs only to authorize the authenticator through `resolved_signer`; this keeps the common authorization path aligned with EIP-8141's native signature schemes. Accounts that want per-credential restrictions MAY additionally read the authenticated `key_id` through `SIGDATACOPY` and apply their own key-level policy. This EIP deliberately does not require either storage layout or policy model.
 
 ### Why `compute_sig_hash` is unchanged
 
@@ -346,14 +342,15 @@ Each condition makes the signature invalid:
 
 1. Account authorizes the authenticator: validation succeeds, `VERIFY` reads `SIGPARAM(0x00)`, `isAuthorized[authenticator]` is true, and `APPROVE` succeeds.
 2. Account does not authorize the authenticator: cryptographic authentication succeeds, but `VERIFY` rejects because the authenticator is not authorized.
-3. Same authenticator, different authenticated `key_id`: supply a proof for a second credential with its matching `key_id`. Protocol authentication succeeds, and the account's behavior is unchanged because authorization is authenticator-level.
+3. Same authenticator, different authenticated `key_id`: supply a proof for a second credential with its matching `key_id`. Protocol authentication succeeds, and an account that authorizes only the authenticator behaves unchanged.
+4. Account applies optional per-key policy: copy the first 32 bytes with `SIGDATACOPY`, assert they equal the authenticated `key_id`, and accept or reject according to account-defined key-level policy.
 
 ### Witness replacement and `key_id` routing
 
 1. Produce two valid proofs for the same `key_id` and assert that they produce the same canonical transaction signature hash and, at equal length, the same fee.
 2. Replace the proof with one authenticating a different key while keeping the claimed `key_id` and assert that validation fails.
 3. Assert that a client can parse `key_id` from the transaction before authenticator execution, and that the signature becomes valid only when the authenticator's result matches it.
-4. Assert that `SIGDATACOPY` and `SIGPARAM(0x03)` on an `AUTHENTICATOR` entry result in an exceptional halt.
+4. Assert that `SIGDATACOPY` on an `AUTHENTICATOR` entry copies the full raw `signature` bytes according to EIP-8141 copy semantics, including the first 32-byte `key_id`.
 
 ### Caching
 
@@ -368,9 +365,9 @@ Each condition makes the signature invalid:
 
 ### Authenticator trust model
 
-The account authorizes an authenticator. The authenticator determines which underlying credentials are valid. `require(isAuthorized[authenticator])` therefore means the account delegates credential-selection and proof-validation semantics to that authenticator.
+The account authorizes an authenticator. The authenticator determines which underlying credentials are valid. `require(isAuthorized[authenticator])` therefore means the account delegates credential-selection and proof-validation semantics to that authenticator unless the account additionally constrains the authenticated `key_id`.
 
-Authorizing an authenticator delegates credential-selection semantics to that authenticator. An authenticator that accepts arbitrary credentials without binding them to the account's intended credential set effectively authorizes every credential supported by that authenticator. Accounts MUST authorize only authenticators whose semantics restrict successful proofs to the intended authority. For example, an account must not authorize a generic "verify any P-256 public key" authenticator unless that authenticator instance, its immutable configuration, or its proof semantics ensures only the intended keys can succeed.
+An authenticator that accepts arbitrary credentials effectively authorizes every credential it accepts when the account performs only authenticator-level authorization. Accounts that need per-credential restrictions MAY read the authenticated `key_id` with `SIGDATACOPY` and enforce additional account-defined policy. Alternatively, the authenticator itself may bind successful proofs to the intended credential set.
 
 ### Unsigned witness
 
