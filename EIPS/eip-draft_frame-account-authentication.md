@@ -1,6 +1,6 @@
 ---
 title: Frame Authenticator Signatures
-description: Adds a bounded, state-independent authenticator signature scheme to frame transactions.
+description: Adds a bounded, state-independent custom-authentication signature scheme to frame transactions.
 author: Taek (@leekt)
 discussions-to: TBD
 status: Draft
@@ -12,17 +12,23 @@ requires: 2929, 7702, 7928, 8141
 
 ## Abstract
 
-This proposal extends [EIP-8141](./eip-8141.md) with an `AUTHENTICATOR` signature scheme. The signature entry's `signer` is an authenticator contract. The protocol executes the authenticator in a bounded, state-independent context; it verifies the proof against the digest and returns the authenticated key identifier. Account code then authorizes `(authenticator, key_id)` under its own policy inside its `VERIFY` frame.
+This proposal extends [EIP-8141](./eip-8141.md) with an `AUTHENTICATOR` signature scheme: a bounded, state-independent custom-authentication path for frame transactions.
+
+`AUTHENTICATOR` allows a frame transaction to carry a custom authentication proof whose expensive cryptographic verification is executed by protocol in a bounded state-independent context. The signature entry's `signer` is an authenticator contract, and its `signature` carries a claimed `key_id` followed by the `proof`. The authenticator returns the credential identifier proven by the witness; validation succeeds only when that identifier equals the claimed `key_id`. Account authorization remains ordinary stateful `VERIFY`-frame logic and authorizes the authenticator address through EIP-8141's existing resolved-signer path.
 
 ```text
-signature.signer = authenticator
+signature = key_id || proof
         |
         | authenticate(digest, proof)
         v
-     key_id
+  authenticated key_id
+        |
+        | require authenticated key_id == claimed key_id
+        v
+  resolved_signer = authenticator
         |
         v
-account VERIFY frame authorizes (authenticator, key_id)
+account VERIFY frame: require isAuthorized[authenticator]
         |
         v
      APPROVE
@@ -32,7 +38,7 @@ account VERIFY frame authorizes (authenticator, key_id)
 
 EIP-8141 validates secp256k1 and P-256 signatures in protocol. Any other scheme must be carried as `ARBITRARY` and verified by account code inside a `VERIFY` frame. This mixes expensive state-independent cryptography with cheap stateful account authorization, and makes the expensive work hard for a sequencer to bound or cache independently of account state.
 
-`AUTHENTICATOR` moves only the expensive, state-independent part into protocol validation. Registration, rotation, and revocation of keys remain stateful account policy and stay in the `VERIFY` frame, where EIP-8141 already bounds and tracks them.
+`AUTHENTICATOR` moves only the expensive, state-independent part into protocol validation, with a protocol-fixed gas budget so that every such signature has a statically known cost. Which authenticator an account trusts remains account policy in the `VERIFY` frame, where EIP-8141 already bounds and tracks it.
 
 ## Specification
 
@@ -46,11 +52,11 @@ This specification is a delta against EIP-8141.
 |---|---:|
 | `AUTHENTICATOR` | `0x03` |
 | `AUTHENTICATOR_HEADER_LENGTH` | `32` |
-| `AUTHENTICATOR_BASE_COST` | `2600` |
 | `AUTHENTICATOR_GAS_LIMIT` | `50000` |
-| `AUTHENTICATOR_COST` | `52600` |
+| `AUTHENTICATOR_BASE_COST` | `COLD_ACCOUNT_ACCESS_COST` |
+| `AUTHENTICATOR_COST` | `AUTHENTICATOR_BASE_COST + AUTHENTICATOR_GAS_LIMIT` |
 
-`AUTHENTICATOR_HEADER_LENGTH` is the length of `key_id`. `AUTHENTICATOR_BASE_COST` conservatively charges one cold account access under [EIP-2929](./eip-2929.md) for the authenticator. `AUTHENTICATOR_COST = AUTHENTICATOR_BASE_COST + AUTHENTICATOR_GAS_LIMIT` is the fixed, protocol-defined cost of one `AUTHENTICATOR` signature; the transaction does not choose the authenticator gas budget.
+`AUTHENTICATOR_HEADER_LENGTH` is the length of `key_id`. `AUTHENTICATOR_BASE_COST` is the [EIP-2929](./eip-2929.md) cold account access cost in the active gas schedule, charged for reading the authenticator's code; it tracks any future repricing of that constant rather than fixing a number here. `AUTHENTICATOR_COST` is the fixed, protocol-defined cost of one `AUTHENTICATOR` signature (`52600` under the current schedule); neither the transaction nor the authenticator chooses the authentication gas budget.
 
 ### Transaction structural changes
 
@@ -58,7 +64,7 @@ The EIP-8141 signature-scheme table is extended with:
 
 | `scheme` | Name | `signer` encoding | `signature` encoding | Gas cost |
 |---|---|---|---|---|
-| `0x03` | `AUTHENTICATOR` | 20-byte authenticator address | `key_id || proof` | `AUTHENTICATOR_COST` |
+| `0x03` | `AUTHENTICATOR` | 20-byte authenticator address | `key_id (32 bytes) || proof` | `AUTHENTICATOR_COST` |
 
 Values `0x04` through `0xff` remain reserved.
 
@@ -87,11 +93,13 @@ signature = key_id                    (32 bytes)
 
 ```python
 authenticator = address(sig.signer)
-key_id = sig.signature[0:32]
+claimed_key_id = sig.signature[0:32]
 proof = sig.signature[32:]
 ```
 
 The `signer` MUST be present and MUST be the authenticator; unlike `SECP256K1` and `P256`, an absent `signer` does not default to `tx.sender`. The `msg` field retains the EIP-8141 meaning: an empty value selects the canonical frame-transaction signature hash and a 32-byte value selects that explicit digest.
+
+The `key_id` is protocol-visible authentication metadata. It identifies the credential claimed by the witness and allows builders and sequencers to route, cache, batch, or otherwise classify authentication work before frame execution. The value is not trusted merely because it appears in the transaction: the authenticator MUST derive the authenticated key identifier from the proof, and protocol validation succeeds only when the returned identifier equals the claimed `key_id`.
 
 An `AUTHENTICATOR` signature is structurally valid only if:
 
@@ -99,7 +107,7 @@ An `AUTHENTICATOR` signature is structurally valid only if:
 assert len(sig.signer) == 20
 assert authenticator != address(0)
 assert len(sig.signature) >= AUTHENTICATOR_HEADER_LENGTH
-assert key_id != bytes32(0)
+assert claimed_key_id != bytes32(0)
 ```
 
 The authenticator MUST contain regular deployed code, MUST NOT be a precompile, and MUST NOT contain an [EIP-7702](./eip-7702.md) delegation indicator. The code currently deployed at the address is what runs.
@@ -117,13 +125,13 @@ interface IFrameAuthenticator {
 }
 ```
 
-The protocol calls `authenticate(digest, proof)` in the [pure authentication context](#pure-authentication-context) with `AUTHENTICATOR_GAS_LIMIT` gas. The authenticator MUST derive the key identity from the proof and return it. The call MUST return exactly 32 bytes equal to the `key_id` in the signature. A zero or different result, malformed return data, revert, exceptional halt, out-of-gas condition, or forbidden operation makes the signature invalid.
+The protocol calls `authenticate(digest, proof)` in the [pure authentication context](#pure-authentication-context) with `AUTHENTICATOR_GAS_LIMIT` gas. The authenticator is responsible for parsing the proof, selecting or deriving the underlying credential, performing cryptographic verification against `digest`, and deriving the authenticated key identifier. The call MUST return exactly 32 bytes equal to the claimed `key_id`. A zero or different result, malformed return data, revert, exceptional halt, out-of-gas condition, or forbidden operation makes the signature invalid.
 
 #### Signature validation
 
 ```python
 def validate_authenticator(sig, sig_hash, state):
-    authenticator, key_id, proof = parse_authenticator(sig)
+    authenticator, claimed_key_id, proof = parse_authenticator(sig)
 
     if len(sig.msg) == 0:
         digest = sig_hash
@@ -134,22 +142,22 @@ def validate_authenticator(sig, sig_hash, state):
 
     require_regular_code(state, authenticator)
 
-    resolved_key_id = pure_authenticator_call(
+    authenticated_key_id = pure_authenticator_call(
         target=authenticator,
         calldata=abi_encode_authenticate(digest, proof),
         gas=AUTHENTICATOR_GAS_LIMIT,
     )
-    if resolved_key_id != key_id:
+    if authenticated_key_id != claimed_key_id:
         return INVALID
 
     return VALID(resolved_signer=authenticator)
 ```
 
-`SIGPARAM(0x00)` returns the authenticator address because the authenticator is the entry's resolved `signer`.
+`SIGPARAM(0x00)` returns the authenticator address because the authenticator is the entry's resolved `signer`. `SIGPARAM(0x01)` and `SIGPARAM(0x02)` retain their EIP-8141 meaning.
 
-EIP-8141's `compute_sig_hash` is not modified. For a canonical-hash `AUTHENTICATOR` entry the entire `signature` field is elided exactly like every other EIP-8141 witness, so `key_id` and `proof` are intentionally unsigned, replaceable witness data. Their integrity comes from the validation chain: `proof` must authenticate under the named authenticator, the `key_id` the authenticator derives from the proof must equal the claimed one, and the verifying account must have authorized `(authenticator, key_id)` for itself.
+EIP-8141's `compute_sig_hash` is not modified. For a canonical-hash `AUTHENTICATOR` entry the entire `signature` field is elided exactly like every other EIP-8141 witness, so `key_id` and `proof` are replaceable witness data. The integrity of `key_id` comes from the authenticator result plus the protocol equality check, not from inclusion in the canonical hash. Once validation succeeds, `key_id` may be treated as authenticated metadata.
 
-Unlike `SECP256K1` and `P256`, `AUTHENTICATOR` signatures are introspectable: `SIGDATACOPY` and `SIGPARAM(0x03)` are defined for `AUTHENTICATOR` entries exactly as for `ARBITRARY`, over the full `signature` bytes.
+`AUTHENTICATOR` is an opaque protocol-validated scheme like `SECP256K1` and `P256`: `SIGDATACOPY` and `SIGPARAM(0x03)` are not defined for it and result in an exceptional halt. No `SIGPARAM` value exposes `key_id`. Builders, sequencers, and other off-chain consumers read `key_id` from the transaction object directly.
 
 There is no fallback from `AUTHENTICATOR` to `ARBITRARY`, account-code signature verification, or another signature scheme.
 
@@ -182,26 +190,30 @@ An opcode introduced after this proposal is forbidden in the pure authentication
 
 ### Access accounting
 
-Signature validation runs before any frame. It does not read or modify the transaction's `accessed_addresses` or `accessed_storage_keys`. The authenticator is cold in the first frame that touches it, exactly as if signature validation had not run.
+Signature validation runs before any frame. Reading the authenticator's code is a world-state access and is accounted as follows.
 
-Validation accesses do not appear in the block-level access list. As with EIP-8141's native signature schemes, signature validation does not happen in EVM execution.
+Authenticator code access performed during protocol signature validation MUST be recorded as a read access for the transaction, at the transaction's block access index, under [EIP-7928](./eip-7928.md). Precompiles reached via `STATICCALL` from the pure authentication context follow EIP-8141's existing rule and are not recorded.
+
+Signature validation MUST NOT add the authenticator to `accessed_addresses` or otherwise modify the EIP-2929 warm set. Warm/cold status during subsequent frame execution is determined solely by EIP-8141's ordinary initial warm set and the accesses performed during frame execution. Block access list accounting and EIP-2929 warmness are therefore independent: the authenticator appears in the block access list for this transaction whether or not any frame later touches it.
 
 ### Signature gas and data accounting
 
 Existing EIP-8141 signature schemes retain their existing costs. For `AUTHENTICATOR`, `signature_gas(sig) = AUTHENTICATOR_COST`. The complete fixed amount is execution gas and is charged if the signature validates, even when the call returns with unused gas. It is also used in maximum transaction cost, payer reservation, and public-mempool verification-gas accounting.
 
-Because the `signature` field is not committed by the canonical hash, its bytes are charged at the worst-case nonzero-byte rate so that the payer's fee does not depend on witness contents:
+Because the `signature` field is not committed by the canonical hash, its bytes are charged at the worst-case nonzero-byte rate:
 
 ```python
 def authenticator_signature_tokens(sig):
     return 4 * len(sig.signature)
 ```
 
-When EIP-8141 computes `signature_data_cost` and `calldata_tokens`, it MUST use `authenticator_signature_tokens(sig)` in place of `tokens_in(sig.signature)` for `AUTHENTICATOR`. The `signer` and `msg` fields retain ordinary transaction-data pricing. The fee still depends on the witness length; an authenticator SHOULD reject a proof whose length is not exactly what its scheme requires, so that a relayer cannot pad the proof.
+When EIP-8141 computes `signature_data_cost` and `calldata_tokens`, it MUST use `authenticator_signature_tokens(sig)` in place of `tokens_in(sig.signature)` for `AUTHENTICATOR`. The `signer` and `msg` fields retain ordinary transaction-data pricing.
+
+This rule removes fee variation caused by witness byte *content*. It does not remove fee variation caused by witness *length*: a relayer replacing a canonical-hash witness with a longer one raises the payer's data cost. This is an inherited property of EIP-8141's witness semantics and applies equally to canonical-hash `ARBITRARY` entries; it is not addressed uniquely here. Authenticators SHOULD use canonical proof encodings and reject proofs with unexpected length or meaningless trailing bytes, which bounds the achievable inflation to the difference between accepted encodings.
 
 ### Account authorization
 
-No new `SIGPARAM` value is introduced. Account code reads the authenticator with `SIGPARAM(0x00)` and `key_id` with `SIGDATACOPY`. A minimal shape is:
+The account authorization unit is the authenticator. Account code reads the authenticator with `SIGPARAM(0x00)` and decides whether it trusts that authenticator. A minimal shape is:
 
 ```solidity
 pragma solidity ^0.8.0;
@@ -217,24 +229,35 @@ conceptually doing:
 require(SIGPARAM(0x01, signatureIndex) == AUTHENTICATOR)
 require(SIGPARAM(0x02, signatureIndex) == 0)   // canonical transaction hash
 authenticator = SIGPARAM(0x00, signatureIndex)
-key_id = SIGDATACOPY(signatureIndex, 0, 32)
-require(isAuthorized[authenticator][key_id])
+require(isAuthorized[authenticator])
 APPROVE(scope)
 ```
 
-An account MAY delegate the `isAuthorized` lookup to an external keystore contract via `STATICCALL` inside its `VERIFY` frame; that call is ordinary frame execution under EIP-8141's existing gas and public-mempool rules. Key rotation policy, recovery, guardians, sessions, locks, storage layout, and wallet presentation are not standardized here; they belong to account implementations or a companion ERC.
+The account does not re-verify or separately authorize `key_id`, and does not parse the proof; those have already been authenticated by the protocol equality check. Authorizing an authenticator delegates credential selection and proof semantics to it (see [Security Considerations](#authenticator-trust-model)). Key rotation policy, recovery, guardians, sessions, locks, storage layout, and wallet presentation are not standardized here; they belong to account implementations or a companion ERC.
 
 ### Public mempool
 
 Consensus validity and public-mempool eligibility are separate: every rule in this section is mempool policy and never affects block validity.
 
-`AUTHENTICATOR` validation counts `AUTHENTICATOR_COST` toward EIP-8141's `MAX_VERIFY_GAS`, not observed execution gas.
+`AUTHENTICATOR` validation counts `AUTHENTICATOR_COST` toward EIP-8141's `MAX_VERIFY_GAS`, not observed execution gas. The only validation dependency of a pending `AUTHENTICATOR` transaction is the authenticator address and its current code; authenticator execution creates no mutable state dependency. Nodes MUST revalidate pending `AUTHENTICATOR` transactions when the authenticator's code changes.
 
-The only validation dependency of a pending `AUTHENTICATOR` transaction is the authenticator address and its current code. Authenticator execution creates no mutable state dependency. Nodes MUST revalidate pending `AUTHENTICATOR` transactions when the authenticator's code changes.
+#### `MAX_VERIFY_GAS` interaction
 
-Consensus places no restriction on which authenticator an `AUTHENTICATOR` signature names. Which ones a node propagates, and which ones a block builder or sequencer includes, is that node's own policy. Each node, builder, or sequencer MAY select its own accepted set of authenticators, identified by address or by runtime code, and MAY reject or deprioritize any `AUTHENTICATOR` transaction outside that set without affecting the transaction's validity elsewhere. Because authenticator execution is state-independent and gas-bounded, a node that admits every authenticator is exposed to at most `AUTHENTICATOR_GAS_LIMIT` of wasted work per invalid signature, comparable to an `ARBITRARY` signature verified in a `VERIFY` frame.
+Under EIP-8141's current `MAX_VERIFY_GAS = 100_000`, two `AUTHENTICATOR` signatures cost `2 * AUTHENTICATOR_COST = 105_200` under the current gas schedule, before any `VERIFY`-frame execution is counted. A transaction containing multiple `AUTHENTICATOR` signatures — for example a sender credential and a sponsor credential — may therefore remain consensus-valid while being ineligible for public-mempool propagation. This EIP does not modify `MAX_VERIFY_GAS`; if sender and sponsor should both be able to use `AUTHENTICATOR` through the public mempool, an explicit `MAX_VERIFY_GAS` adjustment should be proposed separately.
 
-An account that does not want its authentication path subject to builder or sequencer selection is not forced through `AUTHENTICATOR`. It can carry the same proof as an `ARBITRARY` signature and verify it in account code during its `VERIFY` frame under EIP-8141's generic public-mempool rules, at the cost of executing the authentication itself.
+#### Authenticator admission
+
+Consensus does not restrict authenticator addresses beyond the structural and pure-context rules defined here. Nodes MAY apply ordinary local transaction-admission policy, but no authenticator registry or protocol allowlist is defined by this EIP. Because authenticator execution is state-independent and gas-bounded, a node that admits every authenticator is exposed to at most `AUTHENTICATOR_GAS_LIMIT` of wasted work per invalid signature, comparable to an `ARBITRARY` signature verified in a `VERIFY` frame.
+
+#### Authentication caching
+
+Nodes MAY cache authenticator results across pending transactions and blocks. Because authenticator code is deliberately not committed by the transaction and can change at the same address, a cache identity MUST include the code actually executed. A safe cache key includes at least:
+
+```text
+(chain_id, fork_id, authenticator, authenticator_code_hash, digest, key_id, keccak256(proof))
+```
+
+A cache entry keyed without `authenticator_code_hash` may return a result produced by different code and MUST NOT be used.
 
 ## Rationale
 
@@ -242,46 +265,54 @@ An account that does not want its authentication path subject to builder or sequ
 
 The scheme separates two operations with different cost and state profiles:
 
-1. Authenticator execution: expensive, state-independent, bounded by `AUTHENTICATOR_GAS_LIMIT`.
-2. Account authorization: cheap, stateful, account-specific, inside the ordinary `VERIFY` frame.
+1. Protocol authentication: expensive, state-independent, bounded by `AUTHENTICATOR_GAS_LIMIT`. Resolves `(authenticator, key_id)` cryptographically.
+2. Account authorization: cheap, stateful, account-specific, inside the ordinary `VERIFY` frame. Authorizes the authenticator address.
 
-The authenticator proves possession of a key. The account decides whether `(authenticator, key_id)` is currently authorized. Sequencers can cache authentication by `(authenticator, digest, proof)` and re-run only the stateful `VERIFY` frame when account state changes.
+Responsibilities divide as follows. The protocol executes the bounded authenticator, enforces that the authenticated `key_id` equals the claimed one, and exposes the authenticator as `resolved_signer`. The authenticator owns credential selection, proof semantics, cryptographic verification, and derivation of `key_id`. Builders and sequencers see `(authenticator, key_id)` and may use them for routing, caching, batching, aggregation, or DoS accounting. The account owns authorization policy: it trusts or rejects the authenticator and approves.
 
 ### Why `signer` is the authenticator
 
-EIP-8141's `signer` identifies the verifying identity of a protocol-validated entry: the recovered address for `SECP256K1`, the public key for `P256`. For `AUTHENTICATOR` the verifying identity is the authenticator code together with the key it derives, so `signer = authenticator` and the witness carries `key_id`. Registration authority is not a property of the signature; it is account policy, and EIP-8141 already places account policy in the `VERIFY` frame.
-
-### Why there is no in-protocol keystore step
-
-An earlier draft resolved `(account, key_id)` to an authenticator through a keystore contract during signature validation. That step is cheap and stateful, exactly the kind of work `VERIFY` frames already handle, and the account must re-check the same authorization in its `VERIFY` frame regardless, since the protocol cannot know which keystore an account trusts. Executing it in protocol added a second restricted execution context, storage-read caps, a mempool dependency on shared storage slots, and an unsigned `account` witness field that every account had to defensively compare against `address(this)`. Moving the lookup into the `VERIFY` frame removes all of that with no loss of capability: an account that wants a shared or upgradeable keystore calls it with `STATICCALL`, and rotation between authenticators is a storage write in the keystore.
+EIP-8141's `signer` identifies the verifying identity of a protocol-validated entry: the recovered address for `SECP256K1`, the public key for `P256`. For `AUTHENTICATOR` the verifying identity is the authenticator contract, so `signer = authenticator` and account code authorizes it through the existing resolved-signer path with no new instruction.
 
 ### Why the witness carries `key_id`
 
-The account needs a stable identifier for the credential that does not depend on proof encoding. The authenticator derives it from the proof (for example, a hash of the public key or a credential identifier), and the protocol requires the result to equal the `key_id` claimed in the witness. Carrying `key_id` in the witness lets account code read it with the existing `SIGDATACOPY` instruction instead of a new `SIGPARAM` value, and lets nodes know the credential before executing the authenticator. A relayer cannot substitute a proof for a different key: the authenticator's result would not match the claimed `key_id`, and changing the claimed `key_id` yields a pair the account has not authorized.
+`key_id` is claimed in the witness so that builders and sequencers can classify authentication work before executing the authenticator: two transactions naming the same `(authenticator, key_id)` are candidates for the same cache line or batch, and a node can account for or rate-limit per credential. Because the value is unsigned witness data, it is only a claim until the authenticator derives the real identifier from the proof and the protocol checks equality. After that check the claim is authenticated, and nothing downstream needs to re-derive it. Account policy does not consume `key_id`; it remains useful to the protocol and to builders even so.
+
+### Why account authorization is authenticator-level
+
+Requiring accounts to authorize `(authenticator, key_id)` pairs would push credential bookkeeping into every account and would require exposing `key_id` to the EVM. Authorizing the authenticator instead lets the authenticator's own semantics — its immutable configuration, its proof format, the credential set it accepts — define which credentials are valid, and lets an account swap or add credentials by pointing at a different authenticator. An account that wants per-credential policy can deploy or configure an authenticator that enforces it.
+
+### Why `AUTHENTICATOR` is opaque to the EVM
+
+EIP-8141 hides the raw bytes of protocol-validated schemes so that future aggregation schemes remain possible. Since account code needs only `SIGPARAM(0x00)` through `SIGPARAM(0x02)`, exposing the `AUTHENTICATOR` witness or `key_id` to the EVM would buy nothing for accounts while unnecessarily closing off aggregation of authenticator proofs. Builders and sequencers, the intended consumers of `key_id`, read the transaction object directly.
+
+### Why `compute_sig_hash` is unchanged
+
+Committing `key_id` or a proof length in the canonical hash would introduce an `AUTHENTICATOR`-specific hashing rule. The integrity of `key_id` is already established by the authenticator result plus the equality check, and witness-length fee malleability is an inherited property of EIP-8141's canonical-hash witnesses generally. If that semantics should change, it should change consistently in EIP-8141 rather than uniquely here.
 
 ### Why authenticator gas is protocol-fixed
 
-A per-signature gas budget would make `AUTHENTICATOR` cost depend on witness contents, complicating intrinsic-gas computation and public-mempool bounding. A single `AUTHENTICATOR_GAS_LIMIT` gives every `AUTHENTICATOR` signature the same statically known maximum cost, in the same way native schemes have fixed costs.
+A per-signature or per-key gas budget would make `AUTHENTICATOR` cost depend on witness contents, complicating intrinsic-gas computation and public-mempool bounding. A single `AUTHENTICATOR_GAS_LIMIT` gives every `AUTHENTICATOR` signature the same statically known maximum cost, in the same way native schemes have fixed costs. That static bound is the point of the scheme.
+
+### Why `AUTHENTICATOR_BASE_COST` is symbolic
+
+The base cost prices a cold code read. Fixing a numeral here would silently diverge from the EVM's account access price if another EIP reprices it. Tying it to the active `COLD_ACCOUNT_ACCESS_COST` keeps signature pricing consistent with frame-entry pricing under any schedule.
 
 ### Why a signature scheme instead of a pure frame
 
 A separate pure frame would require wallet and account code to coordinate a signature index, pure-frame index, result format, and subsequent `VERIFY` frame. Keeping the witness in the signature list preserves one authentication namespace.
 
-### Why authenticator selection is left to builders
+### Why no authenticator registry
 
-Enshrining a canonical authenticator set in consensus would require a network upgrade to add a scheme and would make the protocol the gatekeeper of authentication methods. Leaving the accepted set to each node, builder, or sequencer keeps consensus neutral. Because `ARBITRARY` remains available for every account, this selection is an optimization path, not a permission to transact.
+`AUTHENTICATOR` has no state reads, no mutable dependencies, fixed verification gas, and deterministic validation constraints. That is exactly the kind of path that should be permissionless. Nodes retain ordinary transaction-admission policy; nothing here needs a registry or allowlist.
 
-### Why `AUTHENTICATOR` is introspectable
+### Why the authenticator code read is in the block access list
 
-EIP-8141 hides the raw bytes of protocol-validated schemes to keep future aggregation possible. An authenticator proof is interpreted by arbitrary authenticator code and cannot be aggregated by the protocol, so hiding it buys nothing.
-
-### Why validation accesses stay out of the block access list
-
-EIP-8141 excludes validation-time accesses from the [EIP-7928](./eip-7928.md) block-level access list because signature validation does not happen in EVM execution. Authenticator execution reads only the authenticator's own code, so the only access to account for is the code read, which follows the same rule.
+Unlike `SECP256K1` and `P256`, whose verification is protocol logic with no contract-code state access, `AUTHENTICATOR` validation reads arbitrary deployed code from world state. EIP-7928 exists to record actual state and code reads, so excluding this one would be inconsistent with its purpose. Warmness is a separate concept: recording the read does not warm the address, and the signature validator does not pay or grant EIP-2929 warmth on behalf of later frames.
 
 ## Backwards Compatibility
 
-This proposal assigns signature scheme `0x03`, which EIP-8141 currently reserves, and defines `SIGDATACOPY` and `SIGPARAM(0x03)` for it. Activation requires a coordinated network upgrade. Pre-upgrade nodes reject transactions using these values; existing EIP-8141 transactions retain their prior behavior.
+This proposal assigns signature scheme `0x03`, which EIP-8141 currently reserves. Activation requires a coordinated network upgrade. Pre-upgrade nodes reject transactions using this value; existing EIP-8141 transactions retain their prior behavior.
 
 ## Test Cases
 
@@ -304,50 +335,56 @@ Each condition makes the signature invalid:
 - signature is shorter than `AUTHENTICATOR_HEADER_LENGTH`;
 - `key_id` is zero;
 - authenticator is a precompile or delegated account;
-- authenticator returns a different `key_id`;
+- authenticator returns a `key_id` different from the claimed one;
 - authenticator returns malformed data;
 - authenticator reverts;
+- authenticator exceeds `AUTHENTICATOR_GAS_LIMIT`;
 - authenticator reads state;
-- authenticator calls a non-precompile;
-- authenticator exceeds `AUTHENTICATOR_GAS_LIMIT`.
-
-### Witness replacement and introspection
-
-1. Produce two valid proofs for the same `key_id` and assert that they produce the same canonical transaction signature hash and, at equal length, the same fee.
-2. Replace the proof with one authenticating a different key and assert that validation fails.
-3. Replace `key_id` with another key the account has not authorized, together with a matching proof, and assert that the account's `VERIFY` frame rejects it.
-4. Assert that `SIGDATACOPY` and `SIGPARAM(0x03)` return the full `AUTHENTICATOR` signature bytes and length.
-
-### Access accounting
-
-1. Assert that the authenticator is cold in the first frame that touches it.
-2. Assert that no validation access appears in the block-level access list.
-
-## Security Considerations
-
-### Authenticator trust
-
-An account that authorizes `(authenticator, key_id)` trusts the authenticator's code to correctly verify possession and to bind `key_id` to the proof. A flawed authenticator that returns a `key_id` not bound to the proof allows anyone to satisfy the account's authorization check. Accounts should authorize only audited authenticators.
-
-### Unsigned witness
-
-`key_id` and `proof` are not committed by the canonical hash and may be replaced by anyone. A replacement cannot select another credential: the authenticator must derive `key_id` from the proof rather than echo the claimed value, the result must equal the claimed `key_id`, and a different `key_id` is a pair the account has not authorized. Authenticators MUST NOT accept a proof that does not bind the returned `key_id`, and SHOULD reject proofs of unexpected length so a relayer cannot inflate the payer's data cost.
-
-### Code upgrade risk
-
-Code is not pinned. An authenticator whose address can be recreated with different runtime code can change behavior under a previously reviewed address. Wallets should only recognize authenticators deployed without that pattern.
-
-### Builder selection and censorship
-
-Because builders and sequencers may choose which authenticators they accept, an `AUTHENTICATOR` transaction may be valid yet not included by a given builder. This is inclusion policy of the same kind builders already apply to any transaction, and a user retains `ARBITRARY`, which is subject to no authenticator selection at all.
-
-### Context consistency
-
-Clients must identically enforce pure-authentication opcodes, returndata validation, gas boundaries, and access accounting. Differences may cause consensus failures.
+- authenticator calls a non-precompile.
 
 ### Account authorization
 
-Accounts must authorize the pair `(authenticator, key_id)`. Authorizing only `key_id` or only the authenticator address loses domain separation and can admit an unintended credential.
+1. Account authorizes the authenticator: validation succeeds, `VERIFY` reads `SIGPARAM(0x00)`, `isAuthorized[authenticator]` is true, and `APPROVE` succeeds.
+2. Account does not authorize the authenticator: cryptographic authentication succeeds, but `VERIFY` rejects because the authenticator is not authorized.
+3. Same authenticator, different authenticated `key_id`: supply a proof for a second credential with its matching `key_id`. Protocol authentication succeeds, and the account's behavior is unchanged because authorization is authenticator-level.
+
+### Witness replacement and `key_id` routing
+
+1. Produce two valid proofs for the same `key_id` and assert that they produce the same canonical transaction signature hash and, at equal length, the same fee.
+2. Replace the proof with one authenticating a different key while keeping the claimed `key_id` and assert that validation fails.
+3. Assert that a client can parse `key_id` from the transaction before authenticator execution, and that the signature becomes valid only when the authenticator's result matches it.
+4. Assert that `SIGDATACOPY` and `SIGPARAM(0x03)` on an `AUTHENTICATOR` entry result in an exceptional halt.
+
+### Caching
+
+1. Cache an authentication result, replace the runtime code at the same authenticator address, and assert that the old result is not reused.
+
+### Access accounting
+
+1. Assert that the authenticator code access appears in the transaction's EIP-7928 block access list.
+2. Assert that validation does not modify EIP-2929 warmness: an authenticator that is neither `tx.sender` nor otherwise in the initial warm set is cold at first frame access, and an authenticator equal to `tx.sender` is warm because EIP-8141 initializes `tx.sender` warm.
+
+## Security Considerations
+
+### Authenticator trust model
+
+The account authorizes an authenticator. The authenticator determines which underlying credentials are valid. `require(isAuthorized[authenticator])` therefore means the account delegates credential-selection and proof-validation semantics to that authenticator.
+
+Authorizing an authenticator delegates credential-selection semantics to that authenticator. An authenticator that accepts arbitrary credentials without binding them to the account's intended credential set effectively authorizes every credential supported by that authenticator. Accounts MUST authorize only authenticators whose semantics restrict successful proofs to the intended authority. For example, an account must not authorize a generic "verify any P-256 public key" authenticator unless that authenticator instance, its immutable configuration, or its proof semantics ensures only the intended keys can succeed.
+
+### Unsigned witness
+
+`key_id` and `proof` are not committed by the canonical hash and may be replaced by anyone. A replacement cannot forge authentication: the authenticator MUST derive `key_id` from the proof rather than echo the transaction-provided value, and the protocol accepts the signature only when the derived value equals the claim. An authenticator that returns a `key_id` not cryptographically bound to the proof allows anyone to satisfy validation for any claimed `key_id` and MUST NOT be authorized.
+
+Witness-length fee malleability is inherited from EIP-8141 canonical-hash witnesses, as described under [Signature gas and data accounting](#signature-gas-and-data-accounting).
+
+### Code upgrade and address reuse
+
+Code is not pinned. An authenticator whose address can be recreated with different runtime code can change behavior under a previously reviewed address. Accounts should only authorize authenticators deployed without that pattern, and node caches MUST key on the executed code hash as described under [Authentication caching](#authentication-caching).
+
+### Context consistency
+
+Clients must identically enforce pure-authentication opcodes, returndata validation, gas boundaries, block access list recording, and warm-set non-modification. Differences may cause consensus failures.
 
 ### Explicit-message signatures
 
