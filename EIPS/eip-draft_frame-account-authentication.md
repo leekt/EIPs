@@ -14,7 +14,7 @@ requires: 2929, 7702, 7928, 8141
 
 This proposal extends [EIP-8141](./eip-8141.md) with an `AUTHENTICATOR` signature scheme: a bounded, state-independent custom-authentication path for frame transactions.
 
-`AUTHENTICATOR` allows a frame transaction to carry a custom authentication proof whose expensive cryptographic verification is executed by protocol in a bounded state-independent context. The signature entry's `signer` is an authenticator contract, and its `signature` carries a claimed `key_id` followed by the `proof`. The authenticator returns the credential identifier proven by the witness; validation succeeds only when that identifier equals the claimed `key_id`. Account authorization remains ordinary stateful `VERIFY`-frame logic and authorizes the authenticator address through EIP-8141's existing resolved-signer path.
+`AUTHENTICATOR` allows a frame transaction to carry a custom authentication proof whose expensive cryptographic verification is executed by protocol in a bounded state-independent context. The signature entry's `signer` is an authenticator contract, and its `signature` carries a claimed `key_id` followed by the `proof`. The authenticator returns the credential identifier proven by the `proof`; validation succeeds only when that identifier equals the claimed `key_id`. Account authorization remains ordinary stateful `VERIFY`-frame logic and authorizes the authenticator address through EIP-8141's existing resolved-signer path.
 
 ```text
 signature = key_id || proof
@@ -99,7 +99,7 @@ proof = sig.signature[32:]
 
 The `signer` MUST be present and MUST be the authenticator; unlike `SECP256K1` and `P256`, an absent `signer` does not default to `tx.sender`. The `msg` field retains the EIP-8141 meaning: an empty value selects the canonical frame-transaction signature hash and a 32-byte value selects that explicit digest.
 
-The `key_id` is protocol-visible authentication metadata. It identifies the credential claimed by the witness and allows builders and sequencers to route, cache, batch, or otherwise classify authentication work before frame execution. The value is not trusted merely because it appears in the transaction: the authenticator MUST derive the authenticated key identifier from the proof, and protocol validation succeeds only when the returned identifier equals the claimed `key_id`.
+The `key_id` is protocol-visible authentication metadata. It identifies the credential claimed for the accompanying `proof` and allows builders and sequencers to route, cache, batch, or otherwise classify authentication work before frame execution. The value is not trusted merely because it appears in the transaction: the authenticator MUST derive the authenticated key identifier from the proof, and protocol validation succeeds only when the returned identifier equals the claimed `key_id`.
 
 An `AUTHENTICATOR` signature is structurally valid only if:
 
@@ -155,7 +155,7 @@ def validate_authenticator(sig, sig_hash, state):
 
 `SIGPARAM(0x00)` returns the authenticator address because the authenticator is the entry's resolved `signer`. `SIGPARAM(0x01)` and `SIGPARAM(0x02)` retain their EIP-8141 meaning.
 
-EIP-8141's `compute_sig_hash` is not modified. For a canonical-hash `AUTHENTICATOR` entry the entire `signature` field is elided exactly like every other EIP-8141 witness, so `key_id` and `proof` are replaceable witness data. The integrity of `key_id` comes from the authenticator result plus the protocol equality check, not from inclusion in the canonical hash. Once validation succeeds, `key_id` may be treated as authenticated metadata.
+EIP-8141's `compute_sig_hash` is not modified. For a canonical-hash `AUTHENTICATOR` entry the entire `signature` field is elided exactly like every other EIP-8141 canonical-hash signature, so both `key_id` and the `proof` witness are replaceable. The integrity of `key_id` comes from the authenticator result plus the protocol equality check, not from inclusion in the canonical hash. Once validation succeeds, `key_id` may be treated as authenticated metadata.
 
 `AUTHENTICATOR` is an opaque protocol-validated scheme like `SECP256K1` and `P256`: `SIGDATACOPY` and `SIGPARAM(0x03)` are not defined for it and result in an exceptional halt. No `SIGPARAM` value exposes `key_id`. Builders, sequencers, and other off-chain consumers read `key_id` from the transaction object directly.
 
@@ -209,7 +209,7 @@ def authenticator_signature_tokens(sig):
 
 When EIP-8141 computes `signature_data_cost` and `calldata_tokens`, it MUST use `authenticator_signature_tokens(sig)` in place of `tokens_in(sig.signature)` for `AUTHENTICATOR`. The `signer` and `msg` fields retain ordinary transaction-data pricing.
 
-This rule removes fee variation caused by witness byte *content*. It does not remove fee variation caused by witness *length*: a relayer replacing a canonical-hash witness with a longer one raises the payer's data cost. This is an inherited property of EIP-8141's witness semantics and applies equally to canonical-hash `ARBITRARY` entries; it is not addressed uniquely here. Authenticators SHOULD use canonical proof encodings and reject proofs with unexpected length or meaningless trailing bytes, which bounds the achievable inflation to the difference between accepted encodings.
+This rule removes fee variation caused by `signature` byte *content*. It does not remove fee variation caused by `signature` *length*: a relayer replacing a canonical-hash proof with a longer one raises the payer's data cost. This is an inherited property of EIP-8141's elided-signature semantics and applies equally to canonical-hash `ARBITRARY` entries; it is not addressed uniquely here. Authenticators SHOULD use canonical proof encodings and reject proofs with unexpected length or meaningless trailing bytes, which bounds the achievable inflation to the difference between accepted encodings.
 
 ### Account authorization
 
@@ -274,9 +274,9 @@ Responsibilities divide as follows. The protocol executes the bounded authentica
 
 EIP-8141's `signer` identifies the verifying identity of a protocol-validated entry: the recovered address for `SECP256K1`, the public key for `P256`. For `AUTHENTICATOR` the verifying identity is the authenticator contract, so `signer = authenticator` and account code authorizes it through the existing resolved-signer path with no new instruction.
 
-### Why the witness carries `key_id`
+### Why the `signature` field carries `key_id`
 
-`key_id` is claimed in the witness so that builders and sequencers can classify authentication work before executing the authenticator: two transactions naming the same `(authenticator, key_id)` are candidates for the same cache line or batch, and a node can account for or rate-limit per credential. Because the value is unsigned witness data, it is only a claim until the authenticator derives the real identifier from the proof and the protocol checks equality. After that check the claim is authenticated, and nothing downstream needs to re-derive it. Account policy does not consume `key_id`; it remains useful to the protocol and to builders even so.
+`key_id` is not part of the witness; the witness is the `proof`. `key_id` is carried alongside it in the `signature` field so that builders and sequencers can classify authentication work before executing the authenticator: two transactions naming the same `(authenticator, key_id)` are candidates for the same cache line or batch, and a node can account for or rate-limit per credential. Because the value is not committed by the canonical hash, it is only a claim until the authenticator derives the real identifier from the proof and the protocol checks equality. After that check the claim is authenticated, and nothing downstream needs to re-derive it. Account policy does not consume `key_id`; it remains useful to the protocol and to builders even so.
 
 ### Why account authorization is authenticator-level
 
@@ -284,11 +284,11 @@ Requiring accounts to authorize `(authenticator, key_id)` pairs would push crede
 
 ### Why `AUTHENTICATOR` is opaque to the EVM
 
-EIP-8141 hides the raw bytes of protocol-validated schemes so that future aggregation schemes remain possible. Since account code needs only `SIGPARAM(0x00)` through `SIGPARAM(0x02)`, exposing the `AUTHENTICATOR` witness or `key_id` to the EVM would buy nothing for accounts while unnecessarily closing off aggregation of authenticator proofs. Builders and sequencers, the intended consumers of `key_id`, read the transaction object directly.
+EIP-8141 hides the raw bytes of protocol-validated schemes so that future aggregation schemes remain possible. Since account code needs only `SIGPARAM(0x00)` through `SIGPARAM(0x02)`, exposing the `AUTHENTICATOR` proof or `key_id` to the EVM would buy nothing for accounts while unnecessarily closing off aggregation of authenticator proofs. Builders and sequencers, the intended consumers of `key_id`, read the transaction object directly.
 
 ### Why `compute_sig_hash` is unchanged
 
-Committing `key_id` or a proof length in the canonical hash would introduce an `AUTHENTICATOR`-specific hashing rule. The integrity of `key_id` is already established by the authenticator result plus the equality check, and witness-length fee malleability is an inherited property of EIP-8141's canonical-hash witnesses generally. If that semantics should change, it should change consistently in EIP-8141 rather than uniquely here.
+Committing `key_id` or a proof length in the canonical hash would introduce an `AUTHENTICATOR`-specific hashing rule. The integrity of `key_id` is already established by the authenticator result plus the equality check, and signature-length fee malleability is an inherited property of EIP-8141's canonical-hash signatures generally. If that semantics should change, it should change consistently in EIP-8141 rather than uniquely here.
 
 ### Why authenticator gas is protocol-fixed
 
@@ -348,7 +348,7 @@ Each condition makes the signature invalid:
 2. Account does not authorize the authenticator: cryptographic authentication succeeds, but `VERIFY` rejects because the authenticator is not authorized.
 3. Same authenticator, different authenticated `key_id`: supply a proof for a second credential with its matching `key_id`. Protocol authentication succeeds, and the account's behavior is unchanged because authorization is authenticator-level.
 
-### Witness replacement and `key_id` routing
+### Proof replacement and `key_id` routing
 
 1. Produce two valid proofs for the same `key_id` and assert that they produce the same canonical transaction signature hash and, at equal length, the same fee.
 2. Replace the proof with one authenticating a different key while keeping the claimed `key_id` and assert that validation fails.
@@ -372,11 +372,11 @@ The account authorizes an authenticator. The authenticator determines which unde
 
 Authorizing an authenticator delegates credential-selection semantics to that authenticator. An authenticator that accepts arbitrary credentials without binding them to the account's intended credential set effectively authorizes every credential supported by that authenticator. Accounts MUST authorize only authenticators whose semantics restrict successful proofs to the intended authority. For example, an account must not authorize a generic "verify any P-256 public key" authenticator unless that authenticator instance, its immutable configuration, or its proof semantics ensures only the intended keys can succeed.
 
-### Unsigned witness
+### Uncommitted `signature` field
 
-`key_id` and `proof` are not committed by the canonical hash and may be replaced by anyone. A replacement cannot forge authentication: the authenticator MUST derive `key_id` from the proof rather than echo the transaction-provided value, and the protocol accepts the signature only when the derived value equals the claim. An authenticator that returns a `key_id` not cryptographically bound to the proof allows anyone to satisfy validation for any claimed `key_id` and MUST NOT be authorized.
+`key_id` and the `proof` witness are not committed by the canonical hash and may be replaced by anyone. A replacement cannot forge authentication: the authenticator MUST derive `key_id` from the proof rather than echo the transaction-provided value, and the protocol accepts the signature only when the derived value equals the claim. An authenticator that returns a `key_id` not cryptographically bound to the proof allows anyone to satisfy validation for any claimed `key_id` and MUST NOT be authorized.
 
-Witness-length fee malleability is inherited from EIP-8141 canonical-hash witnesses, as described under [Signature gas and data accounting](#signature-gas-and-data-accounting).
+Signature-length fee malleability is inherited from EIP-8141 canonical-hash signatures, as described under [Signature gas and data accounting](#signature-gas-and-data-accounting).
 
 ### Code upgrade and address reuse
 
