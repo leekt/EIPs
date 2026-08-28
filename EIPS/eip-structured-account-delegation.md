@@ -7,7 +7,7 @@ status: Draft
 type: Standards Track
 category: Core
 created: 2026-08-28
-requires: 170, 2929, 3541, 3607, 6780, 7702, 8141, 8298, 8397
+requires: 170, 2929, 3541, 3607, 7702, 8141, 8298, 8397
 ---
 
 ## Abstract
@@ -468,7 +468,6 @@ In particular:
 - `SETDELEGATE`-like instructions MUST treat a structured account as nonempty, non-delegated code and MUST NOT overwrite it.
 - [EIP-8298](./eip-8298.md) `SETCODEFROM` and any other self-code-replacement instruction MUST fail when the current account is structured.
 - `SETDESCRIPTOR` MUST fail because it is migration-only.
-- Under [EIP-6780](./eip-6780.md), `SELFDESTRUCT` MUST NOT clear a structured account descriptor, including when the structured account was created earlier in the same transaction.
 
 Version zero intentionally provides no migration from structured account code back to regular code or an EIP-7702 delegation indicator. A later EIP MAY define an admin-authorized exit path.
 
@@ -668,8 +667,7 @@ Implementations MUST cover at least the following cases.
 1. Reject an EIP-7702 authorization attempting to overwrite a structured account.
 2. Reject a `SETDELEGATE`-like overwrite.
 3. Reject `SETCODEFROM` when EIP-8298 is active.
-4. Assert that `SELFDESTRUCT` does not clear the descriptor.
-5. Reject legacy ECDSA transaction origination from the structured account.
+4. Reject legacy ECDSA transaction origination from the structured account.
 
 ### Public mempool
 
@@ -705,6 +703,10 @@ Entry expiry uses `block.timestamp`. Applications must account for the ordinary 
 ### Implementation address mutability
 
 Version zero does not pin the implementation code hash and does not require code to exist at installation time. Accounts share both the benefits and risks of later deployment or code change at that address. Wallets should prefer implementations whose code identity cannot change unexpectedly or wait for a future pinned format.
+
+### Creation-time execution
+
+Normal contract-creation and `SELFDESTRUCT` rules continue to apply. A factory that creates a structured account and invokes its implementation in the same transaction must not treat the descriptor as protection against a malicious implementation during that creation flow.
 
 ### Code-state growth
 
