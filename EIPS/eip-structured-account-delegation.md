@@ -148,7 +148,7 @@ Resolution follows EIP-7702's one-hop behavior. A precompile or empty implementa
 
 The implementation address is not code-hash pinned. A future version MAY introduce a pinned implementation format.
 
-A byte string beginning with `0xef0200` that does not satisfy every structural rule in this EIP is invalid structured account code.
+A byte string beginning with `0xef0200` that does not satisfy every structural rule in this EIP is invalid structured account code. A code-executing operation encountering such bytes causes an exceptional halt rather than treating them as ordinary EVM bytecode.
 
 Equivalent parsing logic is:
 
@@ -384,6 +384,16 @@ signature_index                    (4 bytes, uint32 big-endian)
 new_descriptor                     (remaining bytes)
 ```
 
+The fields are parsed as:
+
+```python
+signature_index = int.from_bytes(
+    frame.data[0:CONFIGURE_HEADER_LENGTH],
+    "big",
+)
+new_descriptor = frame.data[CONFIGURE_HEADER_LENGTH:]
+```
+
 A `CONFIGURE` frame is structurally valid only when:
 
 - `frame.mode == CONFIGURE_MODE`;
@@ -511,7 +521,7 @@ Its mutable validation dependencies are:
 
 A node SHOULD index a pending transaction by these dependencies. Changing the structured account descriptor invalidates pending transactions from or sponsored by that account, but does not invalidate transactions belonging to unrelated accounts.
 
-The direct structured verification gas counts toward EIP-8141 `MAX_VERIFY_GAS`.
+The direct structured verification gas counts toward EIP-8141 `MAX_VERIFY_GAS`. For a `CONFIGURE` frame, its authentication scan and `CONFIGURE_BASE_GAS` count toward `MAX_VERIFY_GAS`, while its declared state budget and descriptor deposit count toward `MAX_VERIFY_STATE_GAS`.
 
 Structured `VERIFY` and `CONFIGURE` frames are added to EIP-8141's direct-evaluation set. A validation prefix consisting only of protocol-defined frames, a possible `CONFIGURE` frame, structured `VERIFY` frames, and otherwise permitted canonical payment frames may be admitted without EVM simulation.
 
@@ -647,7 +657,7 @@ Implementations MUST cover at least the following cases.
 1. Allow `ROLE_EXECUTE` to approve sender execution.
 2. Require `ROLE_SELF_PAY` when sender and payer are the same account.
 3. Require `ROLE_SPONSOR_PAY` when the payer differs from the sender.
-4. Reject role escalation when requested roles are absent from the authority entry.
+4. Reject role escalation when the roles implied by the frame flags are absent from the authority entry.
 5. Reject an expired entry.
 6. Permit `ROLE_ADMIN` only for `tx.sender`.
 
@@ -703,6 +713,10 @@ Entry expiry uses `block.timestamp`. Applications must account for the ordinary 
 ### Implementation address mutability
 
 Version zero does not pin the implementation code hash and does not require code to exist at installation time. Accounts share both the benefits and risks of later deployment or code change at that address. Wallets should prefer implementations whose code identity cannot change unexpectedly or wait for a future pinned format.
+
+### Authenticator code mutability
+
+Version-zero `AUTHENTICATOR` entries bind the authenticator address but not its code hash. If code at that address can change, the credential semantics authorized by the descriptor can change as well. Wallets should authorize immutable authenticator deployments. A future descriptor version may pin the authenticator code hash used during EIP-8397 validation.
 
 ### Creation-time execution
 
