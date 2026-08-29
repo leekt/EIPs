@@ -12,18 +12,16 @@ requires: 170, 2929, 3541, 3607, 7702, 7951, 8141, 8298, 8397
 
 ## Abstract
 
-This proposal introduces a typed structured-account designator:
+This proposal extends EIP-8141 with a structured-account code format that separates ordinary account execution from transaction authorization.
 
 ```text
 0xef02
 || authority_type               (1 byte)
 || execution_implementation     (20 bytes)
-|| authority_payload            (type-defined, fixed length)
+|| authority_payload            (type-defined)
 ```
 
-The designator separates the code used for ordinary account execution from the mechanism used to validate frame transactions. The execution implementation occupies the same position for every authority type, while `authority_type` selects how `VERIFY` frames are handled.
-
-Two authority types are defined initially:
+Two authority types are defined initially.
 
 ```text
 0x00 INLINE_ROOT
@@ -33,8 +31,6 @@ Two authority types are defined initially:
 || key_id                       (32 bytes)
 ```
 
-and:
-
 ```text
 0x01 VERIFY_IMPLEMENTATION
 0xef0201
@@ -42,33 +38,40 @@ and:
 || verification_implementation  (20 bytes)
 ```
 
-`INLINE_ROOT` is the common single-root case. Protocol signature validation resolves a `(verifier, key_id)` pair, and the protocol directly compares it with the descriptor before applying the requested EIP-8141 approval.
+`INLINE_ROOT` directly binds one protocol-authenticated `(verifier, key_id)` pair to the account. `VERIFY_IMPLEMENTATION` loads a dedicated verification implementation while retaining the structured account as the EVM execution context. The verification implementation may consume authenticated signature metadata, call an external actor keystore, and invoke EIP-8141 `APPROVE` from the account context. Ordinary account calls continue to execute the independent `execution_implementation`.
 
-`VERIFY_IMPLEMENTATION` separates validation code from execution code. During a `VERIFY` frame, the protocol loads `verification_implementation` but executes it in the structured account's context. The verification implementation receives `frame.data` unchanged, may consume EIP-8141 signature metadata, may call an external keystore or other authority contract, and calls `APPROVE` from the structured account's address. The protocol does not know the verification implementation's ABI or authority-storage layout.
-
-All non-validation calls execute `execution_implementation` in the structured account's context using one-hop delegation semantics. A `CONFIGURE` frame replaces a structured descriptor after authorization by the current authority path. A `SETDESCRIPTOR` instruction provides a one-way migration path from an existing non-structured account.
+This combines EIP-8141's frame transaction and signature container with EIP-8130's `authenticator -> actor ID -> authorization` model. It does not introduce a second transaction envelope or a second account execution path.
 
 ## Motivation
 
-EIP-8141 allows arbitrary account code to validate frame transactions. This preserves programmability, but couples transaction authorization to the complete wallet implementation. A sequencer that wants to understand validation statically must recognize every wallet implementation or execute and trace arbitrary account code.
+EIP-8141 permits arbitrary account code to validate frame transactions. This preserves programmability, but couples transaction authorization to the complete wallet implementation. A sequencer seeking static validation must either understand every wallet implementation or execute and trace arbitrary wallet code.
 
-Authentication, authorization, and execution have different requirements:
+EIP-8130 separates three responsibilities:
 
-- cryptographic authentication should be bounded and independently cacheable;
-- authorization may need account or keystore state;
-- ordinary account execution should remain fully programmable; and
-- a wallet should not have to standardize its token receivers, session execution, hooks, or application logic merely to obtain a statically understandable validation path.
+```text
+authenticator  -> proves a credential and returns an actor identity
+authority      -> determines what that actor may authorize
+account code   -> performs ordinary execution
+```
 
-EIP-8397 separates expensive state-independent authentication from account authorization by producing an authenticated `(verifier, key_id)` result before frame execution. This proposal separates the remaining authorization path from ordinary execution code.
+The useful parts of both designs can be combined without keeping two native-AA systems:
 
-For a simple account, the root verifier and key identifier are stored directly in the descriptor and no validation bytecode executes. For a richer account, the descriptor points to a dedicated verification implementation. That implementation can be a small adapter which reads an authenticated actor ID, queries a transport-agnostic keystore, checks scope and expiry, and calls `APPROVE`. The account's unrelated execution implementation is never involved in validation.
+1. EIP-8141 remains the single transaction, frame, payment, and signature format.
+2. Protocol or pure signature verification produces a normalized `(verifier, key_id)` result.
+3. A structured account identifies a narrow authority path independently from its execution implementation.
+4. The authority path calls `APPROVE`, after which ordinary EIP-8141 execution continues.
 
-This distinction avoids two opposite extremes:
+A simple account can place one root identity directly in its descriptor. A richer account can select a small verification implementation that queries a multi-actor keystore supporting session keys, expiry, recovery, or threshold authority. The wallet's token receivers, batching helpers, hooks, and other application behavior remain in an unrestricted execution implementation.
 
-- embedding an open-ended list of actors, roles, expiry values, and recovery rules into account code; and
-- requiring the base protocol to understand one particular keystore address, Solidity ABI, storage layout, or scope encoding.
+Executing verification code in the account context solves the immediate EIP-8141 caller problem: the verification code has `ADDRESS == resolved_target`, so it may call `APPROVE` without returning to arbitrary wallet execution code. It also introduces constraints that must be explicit:
 
-A chain may execute any verification implementation through the EVM. A public mempool or L2 may additionally recognize a small set of verification-implementation code hashes and directly evaluate their known semantics. This permits static analysis without maintaining an allowlist of arbitrary wallet execution implementations.
+- verification code and execution code share the account's storage namespace;
+- a top-level verification code-hash allowlist does not automatically bound delegated libraries or external calls;
+- external keystore storage is not admitted by EIP-8141's generic public-mempool rules;
+- code at the verification implementation address may change independently from the descriptor; and
+- code written as a normal stateful contract or proxy does not retain its own storage when executed in another account's context.
+
+This proposal defines those semantics and the profile requirements needed for code-hash-based admission and direct evaluation.
 
 ## Specification
 
@@ -86,6 +89,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | `VERIFY_IMPLEMENTATION_CODE_LENGTH` | `43` |
 | `ECRECOVER_VERIFIER` | `address(0x01)` |
 | `P256_VERIFIER` | `address(0x100)` |
+| `SIGPARAM_KEY_ID` | `0x04` |
+| `SIGPARAM_VERIFIER` | `0x05` |
 | `ROOT_VERIFY_DATA_LENGTH` | `4` |
 | `CONFIGURE_MODE` | `0x03` |
 | `CONFIGURE_LENGTH_BYTES` | `2` |
@@ -95,7 +100,57 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | `CONFIGURE_BASE_GAS` | `5000` |
 | `SETDESCRIPTOR_BASE_GAS` | `5000` |
 
-`STRUCTURED_VERIFY_BASE_GAS`, `CONFIGURE_BASE_GAS`, and `SETDESCRIPTOR_BASE_GAS` are provisional values pending client benchmarks.
+The gas values are provisional pending client benchmarks.
+
+### Unified authentication result
+
+Every protocol-validated signature scheme usable for structured authorization produces:
+
+```text
+AuthenticationResult {
+    verifier    address
+    key_id      bytes32
+}
+```
+
+`verifier` identifies the stateless authentication program or native verification primitive. `key_id` identifies the exact credential or canonical credential configuration proven by the witness.
+
+The initial normalization rules are:
+
+| Signature scheme | `verifier` | `key_id` |
+|---|---|---|
+| EIP-8141 `SECP256K1` | `ECRECOVER_VERIFIER` | recovered address right-aligned in 32 bytes |
+| EIP-8141 `P256` | `P256_VERIFIER` | `keccak256(qx || qy)` |
+| EIP-8397 `AUTHENTICATOR` | authenticator address | authenticated EIP-8397 `key_id` |
+
+For P-256, the full 64-byte public key remains part of the opaque protocol-validated signature entry. Computing its 32-byte identifier does not expose the raw signature witness to EVM code.
+
+An `ARBITRARY` signature entry has no authenticated result. It may still be consumed by account code through EIP-8141 `SIGDATACOPY`, but it cannot authorize `INLINE_ROOT` directly.
+
+A multisig, threshold key, or other compound stateless credential MAY define:
+
+```text
+key_id = keccak256(canonical credential configuration)
+```
+
+provided its authenticator derives that value from the verified witness rather than trusting a transaction-supplied claim.
+
+### EIP-8141 signature attributes
+
+EIP-8141 validated signature entries are extended with immutable `verifier` and `key_id` attributes.
+
+The `SIGPARAM` table is extended with:
+
+| `param` | Return value |
+|---|---|
+| `0x04` | authenticated `key_id` |
+| `0x05` | authenticated `verifier` |
+
+These values are defined only for protocol-validated signatures that produce an `AuthenticationResult`. Requesting either value for `ARBITRARY` results in an exceptional halt.
+
+For EIP-8397 `AUTHENTICATOR`, `SIGPARAM(0x04)` retains the EIP-8397 key identifier and `SIGPARAM(0x05)` returns the authenticator address. For native secp256k1 and P-256 entries, the values are derived according to the table above.
+
+Existing `SIGPARAM(0x00)` `resolved_signer` semantics are unchanged for backward compatibility. Structured authorization SHOULD consume `SIGPARAM_KEY_ID` and `SIGPARAM_VERIFIER` rather than interpreting the scheme-dependent meaning of `resolved_signer`.
 
 ### Structured account envelope
 
@@ -107,7 +162,7 @@ Every structured account begins with:
 || execution_implementation     (20 bytes)
 ```
 
-The byte offsets common to every authority type are:
+The common byte offsets are:
 
 | Bytes | Field |
 |---|---|
@@ -118,11 +173,7 @@ The byte offsets common to every authority type are:
 
 `execution_implementation` MUST be nonzero.
 
-`authority_type` is a tagged-union discriminator, not a sequential version number. Multiple authority types may coexist at the same fork. An incompatible authority representation receives a new `authority_type` value.
-
-Unknown authority types are invalid structured-account code until assigned by a later EIP.
-
-Conceptually:
+`authority_type` is a tagged-union discriminator, not a sequential version number. Multiple authority types may coexist. Unknown authority types are invalid structured-account code until assigned by a later EIP.
 
 ```python
 def parse_structured_account(code):
@@ -140,33 +191,6 @@ def parse_structured_account(code):
 
     invalid_structured_account()
 ```
-
-### Authentication result
-
-Direct structured authorization consumes a normalized authentication result:
-
-```text
-AuthenticationResult {
-    verifier    address
-    key_id      bytes32
-}
-```
-
-The result is produced during protocol signature validation and is immutable for the remainder of the transaction.
-
-For EIP-8141 signature schemes, normalization is:
-
-| Signature scheme | `verifier` | `key_id` |
-|---|---|---|
-| `SECP256K1` | `ECRECOVER_VERIFIER` | recovered Ethereum address right-aligned in 32 bytes |
-| `P256` | `P256_VERIFIER` | `keccak256(qx || qy)` |
-| EIP-8397 `AUTHENTICATOR` | authenticator address | authenticated EIP-8397 `key_id` |
-
-`ARBITRARY` does not produce an `AuthenticationResult`. A verification implementation may nevertheless consume an `ARBITRARY` entry through EIP-8141's existing `SIGDATACOPY` instruction.
-
-For `P256`, `qx || qy` is the 64-byte public key contained in the protocol-validated signature entry. Computing `key_id` does not make the raw signature bytes EVM-visible.
-
-Future protocol-validated signature schemes MAY define a `(verifier, key_id)` normalization through a later EIP.
 
 ### Authority type `0x00`: inline root
 
@@ -198,14 +222,7 @@ assert address(code[23:43]) != address(0)
 assert bytes32(code[43:75]) != bytes32(0)
 ```
 
-The configured `(verifier, key_id)` is the account's root authority. It is implicitly authorized for all structured-account protocol operations:
-
-- approve execution;
-- approve self payment;
-- approve sponsorship payment; and
-- replace the structured descriptor.
-
-Authorization succeeds when:
+The configured `(verifier, key_id)` is full account authority. It may approve execution, self-payment, sponsorship payment, and structured descriptor replacement.
 
 ```python
 def authorize_inline_root(descriptor, auth_result):
@@ -242,74 +259,95 @@ assert address(code[3:23]) != address(0)
 assert address(code[23:43]) != address(0)
 ```
 
-`verification_implementation` identifies code used only for structured-account `VERIFY` and `CONFIGURE` handling. It is not called as an external verifier contract. Its code is loaded and executed with the structured account as the execution-environment address, analogous to EIP-7702 delegated-code execution.
+`verification_implementation` is a code source, not an externally called verifier instance. Its runtime code is loaded while the structured account remains the execution-environment account.
 
-The descriptor MAY be installed before code exists at `verification_implementation`. A `VERIFY` or `CONFIGURE` frame cannot succeed until code resolution produces valid executable verification code.
+The protocol does not assign a Solidity ABI, calldata encoding, actor mapping, keystore address, storage layout, expiry encoding, or scope model to this authority type.
 
-The base protocol does not assign an ABI, calldata schema, storage layout, actor model, scope model, or keystore address to this authority type.
+A verification implementation that needs validation-critical constants SHOULD embed them in its runtime code. A canonical actor-keystore adapter may, for example, embed a deterministic keystore address and use the structured account address plus authenticated `key_id` as its lookup key.
 
-### EIP-8141 frame changes
+Validation-critical pointers stored in ordinary structured-account storage are NOT RECOMMENDED for an authority-separated profile because `execution_implementation` has write access to the same storage during ordinary execution.
 
-The EIP-8141 frame-mode table is extended with:
+### Structured code dispatch
 
-| `mode` | Name | Summary |
-|---|---|---|
-| `0x03` | `CONFIGURE` | replace the sender's structured descriptor after authorization by its current authority path |
+Structured code is recognized before EIP-7702 delegation handling.
 
-The static frame constraint becomes:
+For the top-level call of a frame whose `resolved_target` is a structured account:
 
 ```python
-assert frame.mode < 4
-```
+if frame.mode == VERIFY:
+    if descriptor.authority_type == INLINE_ROOT:
+        execute_inline_root_verify(frame, descriptor)
+    elif descriptor.authority_type == VERIFY_IMPLEMENTATION:
+        execute_verification_implementation(frame, descriptor)
 
-The `ATOMIC_BATCH_FLAG` is also valid for `CONFIGURE` frames under this proposal.
+elif frame.mode == CONFIGURE:
+    execute_structured_configure(frame, descriptor)
 
-During dispatch, valid structured-account code is recognized before ordinary EIP-7702 delegation handling:
-
-```python
-if is_structured_account(resolved_target):
-    descriptor = parse_structured_account(state[resolved_target].code)
-
-    if frame.mode == VERIFY:
-        execute_structured_verify(frame, descriptor)
-    elif frame.mode == CONFIGURE:
-        execute_structured_configure(frame, descriptor)
-    else:
-        execute_structured_execution(frame, descriptor)
 else:
-    assert frame.mode != CONFIGURE
-    execute_existing_eip8141_dispatch(frame)
+    execute_execution_implementation(frame, descriptor)
 ```
 
-A `CONFIGURE` frame targeting an account that is not already structured is invalid. Migration into the structured format uses `SETDESCRIPTOR`.
+This is protocol code selection analogous to EIP-7702 delegated-code dispatch. It is not execution of the `DELEGATECALL` opcode and does not create an additional EVM call frame.
+
+#### Calls back to the frame target
+
+While the current frame mode is `VERIFY` or `CONFIGURE`, any nested code-executing operation whose target is the current frame's `resolved_target` MUST resolve the same verification code section rather than `execution_implementation`.
+
+This prevents verification code from switching into arbitrary execution code through a self-call. Calls to other structured accounts use their ordinary `execution_implementation` unless they are themselves the current frame's resolved target.
+
+A verification implementation can still explicitly execute another address with `DELEGATECALL` or `CALLCODE`. Such code runs in the same account context and may call `APPROVE`. A code-hash admission policy MUST therefore account for transitive delegated code; whitelisting only the top-level verification implementation is insufficient when dynamic delegated calls are permitted.
+
+### Account-context verification execution
+
+A `VERIFY` frame targeting a `VERIFY_IMPLEMENTATION` account executes with:
+
+| Property | Value |
+|---|---|
+| code source | runtime code at `verification_implementation` |
+| `ADDRESS` | structured account (`resolved_target`) |
+| persistent storage | structured account storage |
+| transient storage | structured account transient storage |
+| top-level `CALLER` | EIP-8141 `ENTRY_POINT` |
+| `ORIGIN` | EIP-8141 frame caller, therefore `ENTRY_POINT` in `VERIFY` |
+| `CALLVALUE` | `0` |
+| calldata | `frame.data`, unchanged |
+| static mode | enabled |
+| gas pools | frame-declared EIP-8141 limits |
+| `CODESIZE`, `CODECOPY` | verification implementation code |
+| `EXTCODE*` of `ADDRESS` | structured descriptor code |
+| `SELFBALANCE` | structured account balance |
+
+Code resolution is one hop. A precompile, empty account, EIP-7702 delegation indicator, or another structured descriptor is not recursively resolved as a verification implementation.
+
+Because `ADDRESS == resolved_target`, verification code may invoke EIP-8141 `APPROVE`. An external contract reached with `CALL` or `STATICCALL` has its own address and cannot approve on behalf of the structured account. It must return a result to account-context verification code, which performs the final check and invokes `APPROVE`.
+
+A contract designed as a normal stateful verifier or proxy cannot assume it retains storage at `verification_implementation`: every `SLOAD` observes the structured account's storage. Proxy implementation slots at the verification implementation address are therefore not visible. State belonging to a reusable authority service must be reached through an external call or encoded as immutable runtime-code data.
 
 ### Inline-root `VERIFY`
 
-A `VERIFY` frame targeting an `INLINE_ROOT` account does not execute account code.
-
-Its `frame.data` contains exactly one unsigned 32-bit big-endian signature index:
+An `INLINE_ROOT` `VERIFY` frame contains exactly one unsigned 32-bit big-endian signature index:
 
 ```text
 signature_index    (4 bytes)
 ```
 
-The frame succeeds only when:
+It succeeds only when:
 
 1. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`.
 2. `signature_index < len(tx.signatures)`.
-3. The referenced signature uses the canonical frame-transaction signing hash, meaning `len(sig.msg) == 0`.
-4. The referenced signature produces an `AuthenticationResult`.
+3. The referenced signature uses the canonical frame-transaction signing hash.
+4. The signature produces an `AuthenticationResult`.
 5. The result matches the descriptor's `(verifier, key_id)`.
-6. `frame.flags & APPROVE_SCOPE_MASK != 0`.
-7. Every ordinary EIP-8141 structural rule for the requested approval scope holds.
+6. The frame requests a nonzero EIP-8141 approval scope.
+7. Every ordinary EIP-8141 structural rule for that approval scope holds.
 
-On success, the protocol applies the same effects as:
+On success, protocol applies the same effects as:
 
 ```text
 APPROVE(frame.flags & APPROVE_SCOPE_MASK)
 ```
 
-Conceptually:
+No verification or execution implementation bytecode runs.
 
 ```python
 def execute_inline_root_verify(frame, descriptor, tx):
@@ -320,92 +358,100 @@ def execute_inline_root_verify(frame, descriptor, tx):
     sig = tx.signatures[signature_index]
     assert len(sig.msg) == 0
 
-    auth_result = structured_authentication_result(sig)
+    auth_result = AuthenticationResult(
+        verifier=sig.verifier,
+        key_id=sig.key_id,
+    )
     assert authorize_inline_root(descriptor, auth_result)
 
-    approve_scope = frame.flags & APPROVE_SCOPE_MASK
-    assert approve_scope != 0
-
-    apply_eip8141_approve(
-        resolved_target=resolved_target(frame),
-        scope=approve_scope,
-    )
+    scope = frame.flags & APPROVE_SCOPE_MASK
+    assert scope != 0
+    apply_eip8141_approve(resolved_target(frame), scope)
 ```
-
-No execution or verification implementation bytecode runs on this path.
 
 ### Verification-implementation `VERIFY`
 
-A `VERIFY` frame targeting a `VERIFY_IMPLEMENTATION` account executes `verification_implementation`, not `execution_implementation`.
+A `VERIFY_IMPLEMENTATION` `VERIFY` frame passes `frame.data` unchanged to account-context verification code.
 
-The verification code executes with the following top-level context:
+The implementation MAY:
 
-| Property | Value |
-|---|---|
-| code source | code resolved from `verification_implementation` |
-| `ADDRESS` | structured account address (`resolved_target`) |
-| account storage | structured account storage |
-| `CALLER` | EIP-8141 `ENTRY_POINT` |
-| `CALLVALUE` | `0` |
-| calldata | `frame.data`, unchanged |
-| static mode | enabled, as for an ordinary EIP-8141 `VERIFY` frame |
-| gas pools | the frame's declared execution and state limits, subject to EIP-8141 rules |
+- read `SIGPARAM_KEY_ID` and `SIGPARAM_VERIFIER`;
+- read other EIP-8141 transaction, frame, or signature metadata;
+- consume an `ARBITRARY` witness through `SIGDATACOPY`;
+- read structured-account storage;
+- call a stateless authenticator, actor keystore, or other external authority contract; and
+- invoke `APPROVE` after authorization succeeds.
 
-Code resolution is one hop. If `verification_implementation` is empty, a precompile, an EIP-7702 delegation indicator, or another structured-account designator, no further indirection is followed. The resulting frame cannot approve the transaction unless executable code actually invokes `APPROVE` successfully.
+The frame remains subject to EIP-8141 `VERIFY` semantics:
 
-The verification implementation MAY:
+- execution is static except for protocol-defined `APPROVE` effects;
+- revert, exceptional halt, or failure to call the required `APPROVE` invalidates the frame transaction;
+- the approved scope must be permitted by `frame.flags`; and
+- `APPROVE_EXECUTION` is valid only for `tx.sender`.
 
-- read protocol-validated signature metadata with `SIGPARAM`;
-- read `ARBITRARY` witness bytes with `SIGDATACOPY`;
-- inspect transaction and frame data using EIP-8141 introspection;
-- read the structured account's own storage;
-- call a keystore, verifier, or other authority contract subject to static execution and EIP-8141 validation rules; and
-- call `APPROVE` after it has established authorization.
+`frame.data` is opaque to core protocol. It may use packed bytes, Solidity ABI, RLP, SSZ, or another adapter-defined encoding.
 
-`frame.data` is opaque to the protocol. It may use Solidity ABI encoding, packed bytes, RLP, SSZ, or any implementation-defined encoding.
-
-The verification implementation itself calls `APPROVE`. This works because the code executes with `ADDRESS == resolved_target`. An external contract reached through `CALL` or `STATICCALL` does not become the frame's resolved target and cannot approve on behalf of the account; it must return its result to the verification implementation, which performs the final check and calls `APPROVE` from the account context.
-
-The frame remains subject to every existing EIP-8141 `VERIFY` requirement. In particular:
-
-- the frame executes statically;
-- failure, revert, exceptional halt, or absence of the required `APPROVE` makes the frame transaction invalid;
-- the scope passed to `APPROVE` must match the approval scope declared by `frame.flags`; and
-- public-mempool trace and dependency rules continue to apply unless a node uses an equivalent direct evaluator as described below.
-
-During this delegated verification execution:
-
-- `CODESIZE` and `CODECOPY` observe the verification implementation's code;
-- `EXTCODESIZE`, `EXTCODECOPY`, and `EXTCODEHASH` of the structured account observe the 43-byte structured descriptor; and
-- storage operations address the structured account's storage.
-
-A minimal keystore adapter can conceptually perform:
+A minimal actor-keystore adapter can perform:
 
 ```text
-read signature index from frame.data
-read (verifier, key_id) through SIGPARAM
-call transport-agnostic keystore with (account, verifier, key_id)
-check returned scope / expiry
+signature_index = parse(frame.data)
+authenticator = SIGPARAM(SIGPARAM_VERIFIER, signature_index)
+actor_id = SIGPARAM(SIGPARAM_KEY_ID, signature_index)
+
+config = keystore.authorize(account=ADDRESS,
+                            authenticator=authenticator,
+                            actor_id=actor_id,
+                            requested_scope=FRAMEPARAM(...))
+
+check config / scope / expiry
 APPROVE(requested_scope)
 ```
 
-The keystore does not need to know EIP-8141. Only the verification implementation acts as the transport adapter and uses EIP-8141 introspection and `APPROVE`.
+The authenticator remains stateless: it proves the credential and returns `actor_id`. Account-specific authorization remains in the authority mapping.
+
+The external keystore does not need to understand EIP-8141 instructions. Only the account-context verification implementation reads frame metadata and calls `APPROVE`.
+
+### Authority separation and account storage
+
+Account-context code selection separates validation bytecode from execution bytecode, but it does not by itself isolate their storage.
+
+`execution_implementation` executes with the same structured account storage and can modify any unprotected slot. Therefore:
+
+- an authority stored in ordinary account slots remains mutable by execution code;
+- a verification implementation that reads an implementation pointer, owner, threshold, or key set from ordinary account storage has not fully externalized authority; and
+- whitelisting the verification bytecode does not prevent a malicious execution implementation from changing the data that bytecode trusts.
+
+A profile claiming EIP-8130-style separation of authority from execution MUST satisfy at least one of:
+
+1. ultimate authority is stored in an external keystore whose mutation rules do not trust ordinary execution code;
+2. authority is committed directly in the structured descriptor, as with `INLINE_ROOT`; or
+3. a later EIP defines protocol-protected account storage that ordinary execution cannot modify.
+
+Account-local storage MAY still be used for non-authoritative caches or policy data where execution-controlled mutation is intentional.
 
 ### `CONFIGURE` frame
 
-A structured account may replace its authority type, execution implementation, and authority payload through `CONFIGURE`.
+EIP-8141's frame mode table is extended with:
 
-Configuration is authorized against the current descriptor, not the proposed descriptor. `CONFIGURE` requires transaction payment to have already been established, so unsuccessful configuration work is paid for and lies outside the public-mempool validation prefix.
+| `mode` | Name | Summary |
+|---|---|---|
+| `0x03` | `CONFIGURE` | replace a structured descriptor after authorization by its current authority path |
 
-The frame data is:
+The static frame constraint becomes:
+
+```python
+assert frame.mode < 4
+```
+
+A `CONFIGURE` frame targets `tx.sender`, carries no approval scope or value, and requires payment to have already been established. The `ATOMIC_BATCH_FLAG` is permitted for `CONFIGURE`.
+
+Its data is:
 
 ```text
 new_descriptor_length   (2 bytes, uint16 big-endian)
-new_descriptor          (new_descriptor_length bytes, begins with 0xef02)
+new_descriptor          (new_descriptor_length bytes)
 authorization_data      (remaining bytes)
 ```
-
-`new_descriptor_length` MUST be nonzero, MUST fit within the remaining frame data, and MUST identify a complete valid structured descriptor under an authority type active at the current fork.
 
 A `CONFIGURE` frame is structurally valid only when:
 
@@ -413,177 +459,85 @@ A `CONFIGURE` frame is structurally valid only when:
 2. `tx.sender` currently contains a valid structured descriptor.
 3. `payer != None` before the frame begins.
 4. `frame.flags & APPROVE_SCOPE_MASK == 0`.
-5. No undefined flag bit is set.
+5. no undefined flag bit is set.
 6. `frame.value == 0`.
-7. `len(frame.data) >= CONFIGURE_LENGTH_BYTES + 1`.
-8. At most one `CONFIGURE` frame appears in the transaction.
-9. No `SENDER` frame precedes it.
+7. `new_descriptor` parses under an active authority type.
+8. at most one `CONFIGURE` frame appears in the transaction.
+9. no `SENDER` frame precedes it.
 
-The current authority type authorizes configuration as follows.
+Configuration is authorized against the current descriptor, not the proposed descriptor.
 
 #### Inline-root configuration
 
-For an `INLINE_ROOT` account, `authorization_data` MUST contain exactly one unsigned 32-bit big-endian signature index.
-
-The referenced signature MUST:
-
-- be within `tx.signatures`;
-- use the canonical frame-transaction signing hash; and
-- produce an `AuthenticationResult` matching the current inline root.
-
-Because the canonical signing hash commits to the complete frame list and `frame.data`, the root signature commits to the proposed descriptor.
+For `INLINE_ROOT`, `authorization_data` is one 4-byte signature index. The referenced canonical-hash signature must produce an `AuthenticationResult` matching the current inline root. The canonical transaction hash commits to the complete proposed descriptor.
 
 #### Verification-implementation configuration
 
-For a `VERIFY_IMPLEMENTATION` account, the current `verification_implementation` is executed in the structured account's context with:
+For `VERIFY_IMPLEMENTATION`, the current verification implementation executes in account context under `CONFIGURE_MODE`, static mode, and `frame.data` calldata.
 
-- `frame.data` as calldata, unchanged;
-- `ADDRESS` and storage set to the structured account;
-- `CALLER` set to `ENTRY_POINT`;
-- static mode enabled; and
-- the frame's execution-gas limit.
+It may inspect the exact proposed descriptor and perform an admin, root, recovery, or keystore check. Authorization succeeds only when the top-level execution returns exactly 32 bytes equal to `CONFIGURE_SUCCESS`.
 
-The code can distinguish this path through `FRAMEPARAM(..., mode) == CONFIGURE_MODE`. It may interpret `authorization_data` however it chooses and may inspect the complete proposed descriptor.
+`APPROVE` is invalid in `CONFIGURE` because the frame declares no approval scope. The verification implementation MUST bind its success result to the exact new descriptor, structured account, chain/replay domain, and transaction context required by its authority model.
 
-Configuration authorization succeeds only if execution returns exactly 32 bytes equal to `CONFIGURE_SUCCESS`.
-
-`APPROVE` is not a configuration-authorization mechanism. Calling `APPROVE` during a `CONFIGURE` frame is invalid because the frame declares no approval scope. The verification implementation must return `CONFIGURE_SUCCESS` after its own root, admin, recovery, or keystore check succeeds.
-
-An adapter for an actor keystore would ordinarily require an admin actor for this path, while allowing less privileged actors to approve ordinary execution or payment. These semantics belong to the verification implementation or its companion profile, not this core EIP.
-
-#### Applying configuration
-
-Conceptually:
-
-```python
-def execute_structured_configure(frame, descriptor, tx, state):
-    assert resolved_target(frame) == tx.sender
-    assert payer is not None
-    assert frame.flags & APPROVE_SCOPE_MASK == 0
-    assert frame.value == 0
-
-    new_length = int.from_bytes(frame.data[0:2], "big")
-    assert new_length > 0
-    assert 2 + new_length <= len(frame.data)
-
-    new_descriptor = frame.data[2:2 + new_length]
-    authorization_data = frame.data[2 + new_length:]
-    parse_structured_account(new_descriptor)
-
-    if descriptor.authority_type == INLINE_ROOT:
-        assert len(authorization_data) == 4
-        signature_index = int.from_bytes(authorization_data, "big")
-        sig = tx.signatures[signature_index]
-        assert len(sig.msg) == 0
-        assert authorize_inline_root(
-            descriptor,
-            structured_authentication_result(sig),
-        )
-
-    elif descriptor.authority_type == VERIFY_IMPLEMENTATION:
-        result = execute_verification_implementation(
-            account=tx.sender,
-            implementation=descriptor.verification_implementation,
-            mode=CONFIGURE,
-            calldata=frame.data,
-            static=True,
-            gas=frame.limits.execution,
-        )
-        assert result == CONFIGURE_SUCCESS
-
-    else:
-        invalid_structured_account()
-
-    state[tx.sender].code = new_descriptor
-```
-
-Structural failures make the transaction invalid. An authorization failure, revert, exceptional halt, or wrong return value makes the paid `CONFIGURE` frame fail without replacing code. Ordinary frame and atomic-batch rollback rules apply.
-
-The new descriptor is visible to later frames in the same transaction. A wallet MAY place `CONFIGURE` and later execution frames in one atomic batch so that a failed action restores the previous descriptor.
+On success, protocol replaces `tx.sender` code with `new_descriptor`. The new descriptor is visible to later frames and follows normal frame and atomic-batch rollback semantics.
 
 ### `SETDESCRIPTOR` instruction
 
-`SETDESCRIPTOR` provides a one-way migration path from existing account code or EIP-7702 delegated code into a structured descriptor.
+`SETDESCRIPTOR` provides a one-way migration path from existing account code into structured authority.
 
-The instruction takes two stack items:
-
-```text
-[..., offset, length]
-```
-
-and returns:
+Stack behavior:
 
 ```text
-[..., success]
+[..., offset, length] -> [..., success]
 ```
 
-The memory range `[offset, offset + length)` is interpreted as the complete proposed structured descriptor beginning with `0xef02`.
+The memory range is interpreted as a complete proposed descriptor beginning with `0xef02`.
 
-Execution causes an exceptional halt when:
+The instruction causes an exceptional halt when:
 
-- executed in static mode;
-- executed from initcode; or
-- the current execution-context account is already a structured account.
+- the current transaction is not an EIP-8141 frame transaction;
+- the current frame mode is not `SENDER`;
+- `ADDRESS != tx.sender`;
+- `sender_approved == false` or `payer == None`;
+- execution is static;
+- execution is initcode; or
+- the current execution-context account is already structured.
 
-Otherwise:
+Otherwise, it charges `SETDESCRIPTOR_BASE_GAS`, memory expansion, and the active code-write cost; validates the descriptor; and replaces the current account code on success. Invalid descriptor input pushes `0` and makes no state change.
 
-1. Charge `SETDESCRIPTOR_BASE_GAS` plus memory expansion and the active state/code-write cost.
-2. Parse the proposed descriptor.
-3. If it is invalid, push `0` and make no state change.
-4. If it is valid, replace the current execution-context account's code with the descriptor and push `1`.
+Code reached through EIP-7702 delegation may migrate the delegating account because `ADDRESS` is the delegating account. A conventional smart account may expose an account-authorized migration function that reaches this instruction.
 
-The current execution-context account is the account returned by `ADDRESS`. Code reached through EIP-7702 delegation can therefore migrate the delegating account, and a conventional smart account can expose an account-authorized migration function.
+Once structured, an account can change authority only through `CONFIGURE`.
 
-The current execution frame continues running the code already loaded for that frame. Later calls observe the new structured descriptor.
+`SETDESCRIPTOR_OPCODE` remains to be assigned. Whether this operation should instead be exposed through a system contract or messaging interface is an open design question.
 
-State changes follow ordinary revert semantics.
+### Ordinary execution
 
-`SETDESCRIPTOR` is deliberately disabled once an account is structured. Structured authority can then be changed only through `CONFIGURE`, so ordinary execution code cannot bypass the current authority path.
+For `DEFAULT` and `SENDER` frames targeting a structured account, code is loaded from `execution_implementation` and executes in the structured account context.
 
-### Ordinary execution delegation
+Resolution is one hop. Empty code, precompiles, EIP-7702 delegations, and nested structured descriptors are not recursively followed as execution implementations.
 
-For every code-executing operation targeting a structured account outside `VERIFY` and `CONFIGURE`, the EVM loads code from `execution_implementation` and executes it in the structured account's context.
+During execution:
 
-The affected operations are the same as EIP-7702:
+- `ADDRESS` and storage belong to the structured account;
+- `CODESIZE` and `CODECOPY` observe execution implementation code; and
+- `EXTCODE*` of the structured account observes the descriptor.
 
-- a transaction whose destination is the structured account;
-- `CALL`;
-- `CALLCODE`;
-- `DELEGATECALL`; and
-- `STATICCALL`.
-
-Resolution is one hop only. If `execution_implementation` is empty, a precompile, an EIP-7702 delegation indicator, or another structured-account designator, it is treated as empty code for this resolution path.
-
-During delegated execution:
-
-- `ADDRESS` returns the structured account address;
-- storage operations access the structured account's storage;
-- `EXTCODESIZE`, `EXTCODECOPY`, and `EXTCODEHASH` observe the structured descriptor; and
-- `CODESIZE` and `CODECOPY` observe the loaded execution implementation code.
-
-The execution implementation address is not code-hash pinned by this proposal. Changing code at that address changes account execution behavior but does not directly change the authority payload.
+The execution implementation address is not code-hash pinned by this authority type. Changes to code at that address change account behavior but do not directly alter the authority payload.
 
 ### Code installation and replacement restrictions
 
-EIP-3541 is modified to permit creation-time installation of code beginning with `0xef02` only when the complete code is a valid structured descriptor under an authority type active at the current fork.
+EIP-3541 is modified to permit creation-time installation of code beginning with `0xef02` only when the complete code is a valid structured descriptor under an active authority type.
 
-Unknown or malformed `0xef02` code remains invalid for contract creation.
+EIP-7702 authorization processing MUST NOT overwrite structured code.
 
-EIP-7702 authorization processing MUST NOT overwrite a structured account. This follows from EIP-7702 accepting only empty code or an existing EIP-7702 delegation indicator.
-
-EIP-8298 `SETCODEFROM` MUST fail without changing code when the current execution-context account is structured. Without this restriction, execution implementation code could replace the descriptor and bypass structured authority.
-
-A structured descriptor MUST NOT be a valid source for EIP-8298 `SETCODEFROM`.
+EIP-8298 `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid `SETCODEFROM` source.
 
 `SETDESCRIPTOR` MUST fail for an already structured account.
 
-Any future account-code replacement mechanism MUST explicitly specify whether it can replace structured-account code. The default is that it cannot.
+Any future account-code replacement mechanism MUST explicitly specify whether it may replace structured code. The default is that it may not.
 
-### EIP-3607 transaction origination
-
-Structured accounts have non-empty code and therefore cannot originate legacy ECDSA transactions under EIP-3607.
-
-They originate frame transactions through structured authorization, or another future transaction type that explicitly recognizes this account format.
+Structured accounts have nonempty non-delegation code. Legacy ECDSA transaction origination remains invalid under EIP-3607, while EIP-8141 frame origination is permitted.
 
 ### Gas accounting
 
@@ -591,329 +545,311 @@ Inline-root authorization charges:
 
 ```text
 STRUCTURED_VERIFY_BASE_GAS
-+ ordinary resolved-target account access cost
-+ the referenced signature's protocol-validation cost
++ resolved-target account access
++ referenced signature validation cost
 ```
 
-Verification-implementation authorization uses the frame's ordinary EIP-8141 execution-gas budget. In addition to the resolved-target account access, resolving `verification_implementation` charges the active warm or cold account/code access cost analogously to EIP-7702 delegation resolution. Calls made by the verification implementation, including keystore reads, are charged through normal EVM rules.
+Verification-implementation authorization uses the frame's normal execution-gas budget. Resolving `verification_implementation` charges the applicable warm or cold account/code access cost analogously to EIP-7702. Calls and storage reads made by verification code are charged through normal EVM rules.
 
-A direct evaluator MUST charge the same gas that equivalent EVM execution would charge. Direct evaluation is an execution optimization, not a pricing change.
+A direct evaluator MUST reproduce equivalent EVM gas, warm/cold accesses, approval effects, returndata, and failure behavior. Direct evaluation is an optimization, not a repricing.
 
-`CONFIGURE` charges `CONFIGURE_BASE_GAS`, any verification-implementation execution cost, and the active state/code-update charge for replacing the descriptor.
+`CONFIGURE` charges `CONFIGURE_BASE_GAS`, authority-check execution, and the active descriptor code-write cost. `SETDESCRIPTOR` charges its base cost, memory expansion, and code-write cost.
 
-`SETDESCRIPTOR` charges `SETDESCRIPTOR_BASE_GAS`, memory expansion, and the active state/code-update charge.
+### Public mempool
 
-Ordinary execution delegation charges implementation account access exactly as EIP-7702 charges delegated-code resolution.
+#### Generic EIP-8141 behavior
 
-### Public mempool handling
+An `INLINE_ROOT` `VERIFY` frame is directly evaluable from the descriptor and referenced authenticated signature result.
 
-An `INLINE_ROOT` `VERIFY` frame is directly evaluable from the account descriptor and referenced protocol-validated signature result.
+A `VERIFY_IMPLEMENTATION` frame is consensus-valid by executing its verification code under EIP-8141 `VERIFY` semantics. Without an additional recognized profile, EIP-8141's generic public-mempool trace rules apply.
 
-A `VERIFY_IMPLEMENTATION` frame is consensus-valid by executing the named verification implementation under EIP-8141 `VERIFY` semantics. Public-mempool nodes have three compatible choices:
+In particular, the base EIP-8141 public mempool rejects validation that reads storage outside `tx.sender`. Therefore a verification implementation that calls an external actor keystore may be block-valid but is not generically public-mempool eligible unless the network recognizes an exception/profile for that implementation.
 
-1. simulate and trace the verification implementation under the generic EIP-8141 rules;
-2. recognize a verification-implementation code hash and directly evaluate semantics known to be equivalent to its EVM execution; or
-3. decline to propagate transactions using unrecognized verification implementations as local or chain-specific admission policy.
+#### Code-hash allowlisting is not sufficient by itself
 
-Authority-type `0x01` does not make a keystore, ABI, or storage layout a consensus concept. A canonical keystore adapter may be specified separately by publishing:
+Knowing the top-level verification implementation's runtime code hash establishes which initial bytecode executes. It does not by itself bound:
 
-- verification implementation bytecode and code hash;
-- its frame-data encoding;
-- the keystore calls or storage dependencies it uses;
-- an equivalent direct evaluator; and
-- any L2 admission policy.
+- dynamic `DELEGATECALL` or `CALLCODE` targets running in account context;
+- external `CALL` or `STATICCALL` code and storage dependencies;
+- account-storage values mutable by `execution_implementation`;
+- block/environment dependencies such as timestamp-based expiry;
+- code changes at the verification implementation or external authority addresses; or
+- implementation-specific interpretation of opaque `frame.data`.
 
-A chain that requires fully static validation MAY admit only approved verification-implementation code hashes. This allowlist contains validation adapters, not arbitrary wallet execution implementations. The account remains free to select any execution implementation because that code does not run in the validation prefix.
+A chain may still execute and trace the known bytecode. A chain seeking no-tracing admission must define more than a bare code-hash allowlist.
 
-For a recognized verification implementation, nodes SHOULD index pending transactions by the exact dependency set defined by its direct-evaluation profile. For a generic implementation, dependencies are obtained from its validation trace under EIP-8141.
+#### Recognized verification profiles
 
-The current code hash at `verification_implementation` is always a dependency. Pending transactions MUST be revalidated if that code changes.
+Public-mempool policy MAY recognize a verification profile identified by the runtime code hash at `verification_implementation`.
 
-Because `CONFIGURE` requires `payer != None`, it lies outside the public-mempool validation prefix.
+A complete profile MUST define:
+
+1. the exact runtime code hash;
+2. permitted frame modes and approval scopes;
+3. the maximum validation execution gas;
+4. the frame-data parser or structural constraints;
+5. whether `DELEGATECALL` and `CALLCODE` are forbidden, or the complete permitted transitive code-hash closure;
+6. permitted external call targets and their required code hashes;
+7. an exact dependency function mapping transaction/account inputs to a bounded set of account and storage reads;
+8. permitted environmental dependencies, including timestamp if expiry is checked;
+9. all events that require pending-transaction revalidation; and
+10. an optional direct evaluator that is behaviorally and gas-equivalent to EVM execution.
+
+A profile MAY relax the generic rule forbidding external storage reads, but only for the exact bounded dependencies produced by its dependency function. Any other external storage access rejects the transaction from the public mempool.
+
+A profile that permits dynamic delegated code without pinning its transitive code hashes is incomplete and MUST NOT be used as a no-tracing fast path.
+
+#### Canonical actor-keystore profile
+
+A companion profile can standardize the EIP-8130-style path:
+
+```text
+protocol/pure authenticator
+  -> (verifier, actor_id)
+
+account-context verification implementation
+  -> external keystore lookup(account, actor_id)
+  -> check stored verifier, scope, and expiry
+  -> APPROVE
+```
+
+For bounded invalidation, the actor lookup SHOULD be keyed by both account and actor ID. Any account-level epoch, lock, or shared root additionally read by the profile is a dependency and may increase invalidation fan-out.
+
+To obtain one shared L1/L2 public-mempool path for multi-actor accounts, at least one canonical actor-keystore verification profile, including its code hash and dependency rules, must be standardized or commonly configured. This proposal defines the generic mechanism but does not select that profile.
+
+#### Chain admission
+
+A chain requiring static validation MAY propagate only:
+
+- `INLINE_ROOT`; and
+- `VERIFY_IMPLEMENTATION` descriptors whose current runtime code hash matches a recognized profile.
+
+This allowlist applies to verification implementations, not arbitrary execution implementations. An unrecognized implementation may remain block-valid, be accepted through a private/local mempool, or be rejected by chain-specific public admission policy.
+
+Pending transactions MUST be revalidated when any dependency declared by the active profile changes, including the current verification implementation code hash.
+
+## Remaining design questions
+
+The following issues are not fully solved by account-context verification alone.
+
+### Canonical multi-actor authority profile
+
+The core format intentionally does not select a keystore ABI or storage layout. A unified 8130/8141 deployment still needs agreement on at least one canonical actor-keystore verification profile if multi-actor accounts must propagate through the same public mempool across L1 and L2s.
+
+### Shared storage namespace
+
+Verification and execution code share account storage. Strong authority separation therefore requires external authority state, inline descriptor authority, or future protocol-protected slots. Merely separating code addresses does not prevent execution code from changing account-local authority data.
+
+### Verification code identity
+
+The descriptor stores a verification implementation address rather than an expected code hash. Code changes at that address alter authorization semantics without changing account code. Wallets may rely on immutable deployments, while a future authority type may pin the runtime code hash explicitly.
+
+### Transitive code and state dependencies
+
+A top-level allowlist does not cover dynamic libraries or called contracts. Every no-tracing profile must close over delegated code and exact external state dependencies.
+
+### Migration primitive
+
+`SETDESCRIPTOR` still requires opcode assignment, gas benchmarking, client review, and a decision between an opcode, system contract, or transaction messaging interface.
+
+### Pre-validation authority changes
+
+EIP-8130 permits account changes before validation. The current frame model validates the old authority before a paid `CONFIGURE` or keystore-update execution. Atomic rotation and action are possible using the old authority, but first-use-by-a-new-key and just-in-time actor installation require an explicit construction or later extension.
+
+### Nonce model
+
+Keyed/two-dimensional nonces and nonce-free authorizations remain separate from this proposal. A shared production account profile must decide which nonce extensions are required without blocking the base frame format.
+
+### Validation gas budget
+
+Pure authentication cost plus sender and payer verification must fit the active EIP-8141 public-mempool verification budget. Expensive PQ verification or two custom authenticators may require separate authentication and authorization gas buckets or a larger bound.
+
+### Legacy signature authority
+
+Installing structured code prevents legacy transaction origination and EIP-7702 redelegation, but it does not change `ECRECOVER` results used by third-party contracts, permits, or other message-signature systems. Complete retirement of an old ECDSA key remains a separate compatibility problem.
+
+### Cross-chain authority synchronization
+
+A shared account format does not automatically synchronize descriptor changes or external keystore state across chains. Multichain signed updates, proofs, or root synchronization remain authority-profile concerns.
+
+### Post-execution verification
+
+Post-execution assertions and revert-protection use cases are orthogonal to account authority. `SENDER` execution still requires prior account approval, while later assertions require separate ordering and public-mempool policy.
 
 ## Rationale
 
-### Why authority types are a tagged union
+### Why account-context verification
 
-`INLINE_ROOT` and `VERIFY_IMPLEMENTATION` are not successive revisions of one account. They are alternative validation representations that can coexist.
+EIP-8141 `APPROVE` requires `ADDRESS == resolved_target`. Calling an external verifier directly cannot approve for the account. Loading a dedicated verification code source while retaining the account context lets that narrow code path call `APPROVE` without re-entering arbitrary wallet execution code.
 
-An account selects exactly one authority type. It does not simultaneously combine inline-root authorization and a verification implementation. Switching representations requires an authorized `CONFIGURE` operation.
+### Why this is not ordinary `DELEGATECALL`
 
-### Why execution implementation has a fixed offset
+An actual `DELEGATECALL` would require some account bytecode to initiate it, returning validation to the account implementation problem. Protocol code selection avoids that wrapper and does not add a call frame. The resulting EVM environment intentionally resembles delegated execution.
 
-Every authority type keeps `execution_implementation` at bytes `3..22`.
+### Why an actor ID is required
 
-Ordinary call dispatch therefore does not need to understand authority payloads. Clients can resolve execution from the common header, while `VERIFY` dispatches on `authority_type`.
-
-### Why inline root stores `(verifier, key_id)`
-
-A fixed 32-byte key identifier avoids variable-length public keys in account code and matches authenticator-based identity models.
-
-The verifier defines how a proof maps to `key_id`:
-
-- ECDSA produces an address-derived identifier;
-- P-256 produces a hash of the full public key;
-- EIP-8397 authenticators return `key_id` directly; and
-- future PQ, aggregate, or stateless multisig schemes can use the same identity surface.
-
-The descriptor remains 75 bytes regardless of the underlying public-key or proof size.
-
-### Why a separate verification implementation
-
-A wallet's validation surface is usually much smaller and more standardized than its complete execution surface.
-
-Separating the two allows:
-
-- arbitrary account execution implementations;
-- a small auditable validation adapter;
-- code-hash-based mempool admission and native direct evaluation;
-- a keystore or actor registry without enshrining that registry in the core protocol; and
-- existing wallet execution code to evolve without changing validation semantics.
-
-This corresponds to a two-code-section account: one implementation runs normally and another runs for verification.
-
-### Why verification code executes in account context
-
-EIP-8141 requires the approving code to act from the frame's resolved target. An ordinary call to an external verifier or keystore cannot approve on behalf of the account.
-
-Loading the verification implementation while retaining the structured account as `ADDRESS` solves this without an account-code wrapper:
+An authenticator address identifies a verification algorithm, not the particular key authorized by an account. Every user may share one stateless P-256 authenticator. The authenticator must therefore derive:
 
 ```text
-VERIFY account
-  -> load verification implementation code
-  -> execute with ADDRESS = account
-  -> call external authority if needed
-  -> account-context code calls APPROVE
+actor_id = keccak256(qx || qy)
 ```
 
-The execution implementation is never entered during validation.
+and authorization must bind the exact `(authenticator, actor_id)` pair. `INLINE_ROOT` stores that pair directly; a keystore adapter looks up the returned actor ID in its authority mapping.
+
+### Why verifier code may be allowlisted
+
+Verification implementations are expected to be much fewer and smaller than wallet execution implementations. A chain can recognize a canonical adapter code hash while leaving wallet execution unrestricted.
+
+The profile requirements exist because a code hash names only the first bytecode object. No-tracing admission also needs bounded transitive code, state, environment, and invalidation dependencies.
 
 ### Why the protocol does not know an ABI
 
-`frame.data` is passed unchanged to the verification implementation. The core protocol needs only the verification implementation address and normal EVM dispatch semantics.
+The core protocol forwards `frame.data` unchanged. ABI knowledge belongs to the selected verification profile. This lets raw-EVM chains execute the same adapter while L2 clients optionally implement an equivalent direct evaluator.
 
-A canonical adapter may define a compact four-byte signature index, Solidity ABI, or another encoding, but that choice belongs to the adapter profile. Replacing an adapter's calldata format does not require changing the structured-account envelope.
+### Why inline root remains useful
 
-### Keystore compatibility
+A single-root account should not pay an extra contract and storage read. `INLINE_ROOT` is the one-entry specialization of the same `(verifier, actor_id) -> authority` model used by a multi-actor keystore.
 
-A transport-agnostic keystore can continue to expose its existing contract interface and storage model. A small EIP-8141-aware verification implementation adapts frame signature metadata to that interface and calls `APPROVE` after the keystore authorizes an actor.
+### Why ordinary account storage is insufficient for strong separation
 
-Responsibilities are therefore:
+Code separation and state separation are distinct. Both code sections execute with the account's storage, so execution code can mutate slots read by verification code. An external keystore earns its place when authority must remain outside arbitrary wallet execution.
 
-```text
-EIP-8141 signature list / EIP-8397
-  -> authentication result
+### Why signatures remain in the EIP-8141 list
 
-verification implementation
-  -> frame-aware adapter and final APPROVE
+The signature list provides a common location for protocol validation, witness elision, future aggregation, and signatures consumed during ordinary execution. Structured authority changes how authenticated results are authorized; it does not create a second signature namespace.
 
-keystore
-  -> transport-agnostic actor authorization
+### Why configuration is separate from execution approval
 
-execution implementation
-  -> ordinary wallet behavior
-```
-
-The keystore itself does not need EIP-8141 opcodes.
-
-### Session keys and richer authority
-
-A session key, recovery path, multisig, or scoped actor does not require additional entries in the structured descriptor.
-
-A verification implementation may read account storage or call an external authority contract containing multiple actors, scope, expiry, thresholds, or recovery state. It then calls only the EIP-8141 approval scope authorized by that state.
-
-Application-specific execution restrictions such as target allowlists and token-spend limits may remain in post-payment execution logic. A canonical adapter profile may define a stronger session-policy path without changing this core EIP.
-
-### Why no mandatory keystore type
-
-Defining actor-slot derivation, packing, expiry, scope constants, and update digests in the core EIP would make one wallet authority model consensus-critical.
-
-`VERIFY_IMPLEMENTATION` preserves a raw-EVM implementation path while allowing a chain to optimize a canonical keystore adapter by code hash. Different chains may recognize different fast paths without changing the account envelope.
-
-### Why direct evaluation is optional
-
-Direct evaluation and EVM execution must be behaviorally equivalent. A base layer can accept arbitrary verification implementations and execute them normally. A high-throughput L2 can restrict its public mempool to a small set of known code hashes and avoid tracing those paths.
-
-Restrictiveness is therefore an admission policy layered on a permissive consensus mechanism.
-
-### Why signatures remain outside calldata
-
-The structured descriptor changes how accounts consume authentication results; it does not replace EIP-8141's signature list.
-
-Keeping signatures in the transaction signature list preserves independent validation, witness elision, future aggregation, and use of signatures during ordinary execution such as ERC-1271, permits, and admin operations.
-
-### Why `CONFIGURE` uses a return value
-
-Ordinary EIP-8141 `APPROVE` represents execution and payment approval. Configuration authority is a distinct account-level operation and should not be conflated with either scope.
-
-A dedicated `CONFIGURE` frame executes the current verification implementation statically and requires a fixed return value. This lets the implementation distinguish an admin or recovery path from ordinary session execution without adding keystore-specific scope constants to the core protocol.
-
-### Why `SETDESCRIPTOR` is one-way
-
-Existing accounts need a migration path, but allowing the ordinary execution implementation of an already structured account to rewrite its descriptor would put ultimate authority back into arbitrary execution code.
-
-`SETDESCRIPTOR` is therefore available only before structured authority is installed. Once structured, all updates use `CONFIGURE` and the current authority path.
+Execution/payment approval does not imply root or recovery authority for a multi-actor account. `CONFIGURE` therefore uses the current authority path and a separate fixed success result rather than treating any session key with `APPROVE_EXECUTION` as an administrator.
 
 ### Validation after execution
 
-This proposal does not require every `VERIFY` frame to precede every execution frame. Post-execution assertions and revert-protection schemes remain an orthogonal EIP-8141 concern.
-
-A `SENDER` frame still requires sender approval before it executes. A later `VERIFY` frame may assert a postcondition only where the active transaction and mempool rules permit such ordering.
+This proposal does not require every verification-like assertion to precede execution. Account authority must be established before `SENDER` frames, while zero-slippage or other postconditions may be evaluated later where transaction and mempool rules permit.
 
 ## Backwards Compatibility
 
-This proposal requires a network upgrade because it assigns special semantics to `0xef02`, adds an EIP-8141 frame mode, and introduces an EVM instruction.
+This proposal requires a network upgrade because it assigns special semantics to `0xef02`, extends EIP-8141 signature introspection and frame modes, and introduces a descriptor-installation operation.
 
-EIP-3541 currently prevents newly deployed code beginning with `0xef`, so no currently deployable regular contract is reinterpreted as a structured account.
+EIP-3541 prevents newly deployed ordinary code beginning with `0xef`, so existing deployable EVM contracts are not reinterpreted as structured accounts.
 
-Pre-upgrade clients reject creation of these descriptors and do not understand `CONFIGURE` or `SETDESCRIPTOR`.
+Pre-upgrade clients reject structured descriptors and do not understand the new signature attributes, `CONFIGURE`, or `SETDESCRIPTOR`.
 
 ## Test Cases
 
 Implementations MUST cover at least the following cases.
 
-### Common descriptor parsing
+### Authentication result
 
-1. Reject code not beginning with `0xef02` when parsed as structured code.
-2. Reject a zero execution implementation.
-3. Reject an unknown authority type.
-4. Confirm the execution implementation is always read from bytes `3..22`.
+1. A secp256k1 signature exposes `verifier = address(0x01)` and the recovered address as `key_id`.
+2. A P-256 signature exposes `verifier = address(0x100)` and `keccak256(qx || qy)` as `key_id`.
+3. EIP-8397 exposes the authenticator address and returned key identifier.
+4. `SIGPARAM_KEY_ID` and `SIGPARAM_VERIFIER` halt on `ARBITRARY`.
+5. Raw P-256 signature bytes remain unavailable through `SIGDATACOPY`.
+
+### Descriptor parsing
+
+1. Accept valid 75-byte `INLINE_ROOT` and 43-byte `VERIFY_IMPLEMENTATION` descriptors.
+2. Reject zero implementation, verifier, key ID, or verification implementation.
+3. Reject malformed lengths and unknown authority types.
+4. Confirm `execution_implementation` always occupies bytes `3..22`.
 
 ### Inline root
 
-1. Accept exactly `0xef0200 || execution_implementation || verifier || key_id` with valid nonzero fields.
-2. Reject every length other than 75 bytes.
-3. Accept a matching secp256k1 authentication result.
-4. Reject another ECDSA address.
-5. Accept a matching P-256 `keccak256(qx || qy)` key ID.
-6. Accept a matching EIP-8397 authenticator and `key_id`.
-7. Reject a matching `key_id` from a different verifier.
-8. Reject an `ARBITRARY` signature entry as an inline root.
+1. Accept a matching `(verifier, key_id)` and requested approval scope.
+2. Reject the same key ID under another verifier.
+3. Reject another P-256 key even when a truncated account representation would collide.
+4. Use a stateless multisig authenticator whose returned key ID commits to threshold configuration.
 
-### Verification implementation
+### Verification context
 
-1. Accept exactly `0xef0201 || execution_implementation || verification_implementation` with nonzero addresses.
-2. Reject every length other than 43 bytes.
-3. Confirm a `VERIFY` frame loads verification code rather than execution code.
-4. Confirm `ADDRESS` and storage context equal the structured account.
-5. Confirm `CALLER == ENTRY_POINT` and calldata equals `frame.data` byte-for-byte.
-6. Confirm `CODESIZE` observes verification implementation code while `EXTCODESIZE(ADDRESS)` observes 43 bytes.
-7. Have the verification implementation read a signature with `SIGPARAM`, authorize it, call `APPROVE`, and succeed.
-8. Return normally without `APPROVE` and reject the frame transaction under EIP-8141 rules.
-9. Call `APPROVE` with a scope different from `frame.flags` and reject.
-10. Call an external keystore, receive an authorization result, then call `APPROVE` from the account context.
-11. Attempt to call `APPROVE` from the external keystore itself and reject it because the keystore is not the resolved target.
-12. Verify that an `ARBITRARY` witness can be consumed through `SIGDATACOPY`.
+1. Confirm `VERIFY` loads verification code, not execution code.
+2. Confirm `ADDRESS`, storage, and balance belong to the structured account.
+3. Confirm top-level `CALLER` and `ORIGIN` equal `ENTRY_POINT`.
+4. Confirm calldata equals `frame.data` byte-for-byte.
+5. Confirm `CODESIZE` sees verification code while `EXTCODESIZE(ADDRESS)` sees 43 bytes.
+6. Confirm a normal proxy implementation reads the structured account's slots rather than the proxy address's slots.
+7. Confirm a nested call back to the frame's resolved target re-enters verification code and cannot switch to execution code.
+8. Confirm a direct `DELEGATECALL` to another library retains the account address and that such a library can call `APPROVE`.
+9. Confirm an external keystore called with `CALL` cannot itself call `APPROVE` for the account.
+10. Confirm the verification implementation can validate the keystore result and call `APPROVE`.
 
-### Execution separation
+### Storage separation
 
-1. Confirm a `SENDER` or ordinary call executes `execution_implementation`, not `verification_implementation`.
-2. Confirm ordinary delegated execution uses the structured account's address and storage.
-3. Confirm changing execution-implementation code does not alter the descriptor's verification-implementation address.
+1. Store an owner in ordinary account storage and show that execution code can change it.
+2. Store the same authority in an external keystore and show that ordinary execution cannot change it unless the keystore authorizes the mutation.
+3. Confirm a recognized authority-separated profile rejects validation-critical account-storage pointers unless explicitly part of its trust model.
+
+### Recognized profiles
+
+1. Reject a claimed no-tracing profile that permits an unpinned dynamic `DELEGATECALL` target.
+2. Admit a profile with a fixed transitive code closure and exact actor-slot dependency.
+3. Allow only the declared external keystore slot and reject any additional storage read.
+4. Track timestamp as a dependency for expiry.
+5. Change verification code, external authority code, or a declared storage slot and revalidate pending transactions.
+6. Directly evaluate the profile and reproduce EVM success, gas, warmness, returndata, and approval effects.
 
 ### Configuration
 
-1. Configure `INLINE_ROOT -> INLINE_ROOT` with a canonical-hash signature from the current root.
-2. Configure `INLINE_ROOT -> VERIFY_IMPLEMENTATION` with the current root.
-3. Execute the current verification implementation in `CONFIGURE` mode and accept exactly `CONFIGURE_SUCCESS`.
-4. Reject a wrong-length or wrong-value configuration return.
-5. Reject state writes attempted by the verification implementation during configuration.
-6. Configure `VERIFY_IMPLEMENTATION -> INLINE_ROOT` after the verification implementation authorizes the exact new descriptor.
-7. Configure `VERIFY_IMPLEMENTATION -> VERIFY_IMPLEMENTATION` and observe the new verification code in a later frame.
-8. Reject configuration before payment is established.
-9. Reject more than one `CONFIGURE` frame.
-10. Reject `CONFIGURE` after a `SENDER` frame.
-11. Place `CONFIGURE` and later execution in an atomic batch, fail the later frame, and restore the old descriptor.
-12. Execute a non-atomic successful `CONFIGURE`, fail a later independent frame, and retain the new descriptor.
+1. Rotate an inline root with a canonical-hash signature from the current root.
+2. Switch from inline root to verification implementation.
+3. Authorize configuration through an external keystore admin and return `CONFIGURE_SUCCESS`.
+4. Reject a configuration result not bound to the exact proposed descriptor.
+5. Roll back configuration with a failed atomic batch.
+6. Keep a successful non-atomic configuration when a later independent frame fails.
 
-### Migration
+### Migration and code replacement
 
-1. Use `SETDESCRIPTOR` from regular account code and install a valid inline-root descriptor.
-2. Use `SETDESCRIPTOR` while executing EIP-7702 delegated code and update the delegating account.
-3. Install a verification-implementation descriptor from an existing smart account's authorized migration function.
-4. Reject `SETDESCRIPTOR` from an already structured account.
-5. Reject malformed descriptor input without changing code.
-6. Confirm migration reverts when the containing frame reverts.
-
-### Code replacement restrictions
-
-1. Confirm EIP-7702 authorization cannot overwrite structured code.
-2. Confirm EIP-8298 `SETCODEFROM` cannot replace a structured descriptor.
-3. Confirm a structured descriptor cannot be used as an EIP-8298 source.
-
-### Public mempool and direct evaluation
-
-1. Simulate an unrecognized verification implementation under generic EIP-8141 rules.
-2. Directly evaluate a recognized implementation and confirm identical success, gas, approval effects, and dependencies to EVM execution.
-3. Change code at `verification_implementation` and revalidate pending transactions.
-4. Confirm an L2 admission policy may reject an unrecognized verification code hash without changing block validity.
-5. Confirm execution-implementation diversity does not affect recognition of the validation path.
+1. Migrate an approved EIP-7702 account in a paid `SENDER` frame.
+2. Migrate a conventional smart account through its authorized function.
+3. Reject migration before sender approval or payment.
+4. Reject `SETDESCRIPTOR` from a structured account.
+5. Confirm EIP-7702 and EIP-8298 cannot overwrite structured code.
 
 ## Security Considerations
 
-### Inline-root compromise
+### Verification implementation is authority code
 
-The inline root has complete account authority. Compromise permits execution, payment, sponsorship, implementation replacement, authority-type replacement, and root rotation.
+A verification implementation decides whether `APPROVE` or configuration succeeds. A bug that ignores the transaction hash, misparses a key ID, trusts an unauthenticated external result, or grants excessive scope compromises every account using it.
 
-Wallets SHOULD protect an inline root as ultimate account authority.
+### Code-hash changes
 
-### Verification-implementation correctness
+The descriptor names an address, not a code hash. Verification code changes alter authority semantics without changing the descriptor. Nodes must revalidate pending transactions, and wallets should prefer immutable deployments or an authority type that pins code identity.
 
-A verification implementation defines the account's authorization policy. Code that accepts an unauthenticated witness, ignores the canonical transaction hash, misinterprets an external keystore result, or calls `APPROVE` with excessive scope compromises every account pointing to it.
+### Transitive delegated code
 
-Wallets and L2 fast paths MUST treat verification-implementation code as security-critical.
+Any code reached through `DELEGATECALL` or `CALLCODE` runs as the structured account and may invoke `APPROVE`. A top-level implementation allowlist does not secure dynamic delegate targets. No-tracing profiles must forbid or pin the full delegated code closure.
 
-### Verification-implementation code changes
+### Shared account storage
 
-Authority type `0x01` stores a verification implementation address, not a code hash. If code at that address changes, account authorization semantics may change without changing the structured descriptor.
-
-Wallets SHOULD use immutable verification implementations or treat upgrade authority over that address as equivalent to account root authority. Nodes MUST include the current verification code hash in validation caches and revalidate pending transactions after a change.
-
-A later authority type may pin an expected verification code hash.
-
-### Account-context execution
-
-Verification code executes with the structured account as `ADDRESS` and with access to its storage. Static mode prevents writes during ordinary `VERIFY` and configuration authorization, but the code can read sensitive account state and can delegate to or call other code under the active EIP-8141 rules.
-
-Libraries reached with `DELEGATECALL` execute in the same account context and can call `APPROVE`; they must be treated as fully trusted verification code.
+Verification and execution code share storage. A malicious execution implementation can change every ordinary account slot. Authority kept in those slots is not isolated from wallet code.
 
 ### External authority contracts
 
-An external keystore or verifier called by the verification implementation cannot itself approve the structured account. The verification implementation must validate the external return value and invoke `APPROVE` from the account context.
+An external keystore cannot approve directly, but malicious or upgradeable authority code can return forged authorization to an adapter that trusts it. Its code, storage, and upgrade authority are part of the security boundary and dependency set.
 
-A malicious or upgradeable external authority contract can still cause the verification implementation to approve unauthorized actions if the adapter trusts its output. Its code and upgrade authority are part of the account's security boundary.
+### Reentrancy and self-calls
 
-### Opaque calldata and wallet presentation
+Calls back to the frame target re-enter verification code. Verification implementations should reject unexpected callers or recursive entry where appropriate. Recognized profiles must specify whether such calls are permitted.
 
-The protocol does not understand `frame.data` for authority type `0x01`. Wallets, explorers, and sequencers need implementation-specific parsers to explain which credential, keystore entry, or policy is being used.
+### Opaque calldata
 
-Unknown verification implementations SHOULD be presented as unrecognized validation logic rather than decoded using another implementation's ABI.
+The protocol does not parse `frame.data` for authority type `0x01`. Wallets and explorers need a parser associated with the recognized verification profile. Unknown code must not be decoded using another profile's ABI.
 
 ### Configuration authorization
 
-A verification implementation returning `CONFIGURE_SUCCESS` must bind its authorization to the exact proposed descriptor and transaction context. Validating a detached message that does not commit to the new descriptor, chain, account, and replay domain may allow unauthorized configuration or replay.
+`CONFIGURE_SUCCESS` must be returned only after authorization commits to the exact new descriptor, account, chain/replay domain, and relevant transaction context. Detached admin signatures may enable replay or descriptor substitution.
 
-For inline roots, this EIP requires the canonical transaction signing hash, which commits to `frame.data`.
+### Migration
 
-### Configuration ordering
+`SETDESCRIPTOR` relies on the old account authority to approve a paid `SENDER` frame and reach the instruction. A vulnerability in the old account or delegated implementation may permit unauthorized permanent migration.
 
-A successful non-atomic `CONFIGURE` remains applied if an independent later frame fails. Wallets requiring all-or-nothing rotation and execution MUST place the relevant frames in an atomic batch.
+### Legacy signatures
 
-### Migration authorization
-
-`SETDESCRIPTOR` relies on the existing account code to decide who may reach the instruction. A bug in a pre-migration smart account or EIP-7702 implementation may permit unauthorized permanent migration.
-
-After migration, `SETDESCRIPTOR` is disabled and only the structured configuration path may update authority.
-
-### Execution-implementation risk
-
-The execution implementation runs with the structured account's address, balance, and storage. Malicious execution code can transfer assets or corrupt wallet state during an authorized action.
-
-It cannot directly replace an already structured descriptor through `SETDESCRIPTOR` or `SETCODEFROM`, but users must still treat implementation changes as full wallet-code upgrades.
+Structured migration disables legacy transaction origination but does not revoke message signatures already recognized by external contracts. Wallets must not represent descriptor rotation as universal retirement of the old ECDSA identity.
 
 ### Client consistency
 
-Clients must agree on descriptor parsing, type dispatch, authentication-result normalization, delegated verification context, `APPROVE` caller semantics, configuration return handling, code-replacement behavior, gas accounting, and rollback semantics. Divergence is consensus-critical.
+Clients must agree on descriptor parsing, signature attribute derivation, mode-sensitive code resolution, account-context EVM semantics, `APPROVE` caller checks, profile dependency handling, gas accounting, configuration results, and rollback behavior. Divergence is consensus-critical.
 
 ## Copyright
 
