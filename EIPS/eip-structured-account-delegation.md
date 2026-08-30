@@ -12,7 +12,7 @@ requires: 170, 2929, 3541, 3607, 7702, 7951, 8141, 8298, 8397
 
 ## Abstract
 
-This proposal extends EIP-8141 with a structured-account code format that separates ordinary account execution from transaction authorization.
+This proposal extends [EIP-8141](./eip-8141.md) with a structured-account code format that separates ordinary account execution from transaction authorization.
 
 ```text
 0xef02
@@ -40,7 +40,12 @@ Two authority types are initially defined.
 
 `INLINE_ROOT` directly binds one protocol-authenticated `(verifier, key_id)` pair to the account.
 
-`VERIFY_IMPLEMENTATION` loads code from `verification_implementation` while retaining the structured account as the EVM execution context. The verification implementation receives frame calldata unchanged, chooses where and how authority state is stored, and invokes EIP-8141 `APPROVE` from the account context. Ordinary calls execute the independent `execution_implementation`.
+`VERIFY_IMPLEMENTATION` loads code from `verification_implementation` while retaining the structured account as the EVM execution context. The selected code receives frame calldata unchanged, chooses where and how authority state is represented, and invokes EIP-8141 `APPROVE` from the account context. Ordinary calls execute the independent `execution_implementation`.
+
+A new `CONFIGURE` frame mode and mode-specific `APPROVE_CONFIGURE` action support both:
+
+1. replacing the structured descriptor; and
+2. mutating authority state consumed by the current verification implementation.
 
 This combines EIP-8141's frame transaction, payment, execution, and signature container with EIP-8130's `authenticator -> actor identity -> authorization` model. It does not define a second transaction envelope, a second signature namespace, or a mandatory keystore layout.
 
@@ -63,9 +68,16 @@ The useful parts of both designs can be combined into one native account model:
 3. A structured account selects a narrow authorization path independently from ordinary wallet execution.
 4. The authorization path invokes `APPROVE`, after which ordinary frame execution continues.
 
-The common single-root case requires no state lookup beyond the account descriptor. Richer accounts may select a dedicated verification implementation that uses account storage, a per-account authority contract, a shared keystore, immutable code data, a Merkle commitment, or another authority representation.
+The common single-root case requires no state lookup beyond the account descriptor. Richer accounts may select a dedicated verification implementation that uses account storage, a deterministic per-account authority contract, a shared keystore, immutable code data, a committed root, or another authority representation.
 
-The core protocol deliberately does not select among those storage models. The chosen verification implementation owns its ABI, state layout, actor mapping, scope model, expiry model, and update mechanism. A chain may recognize selected verification implementation code hashes for public-mempool admission or equivalent direct evaluation without constraining the account's ordinary execution implementation.
+The core protocol deliberately does not select among those storage models. The selected verification implementation owns its ABI, state layout, actor mapping, scope model, expiry model, and update mechanism. A chain may recognize selected verification implementation code hashes for public-mempool admission or equivalent direct evaluation without constraining the account's ordinary execution implementation.
+
+Configuration also needs the same separation. Changing the descriptor and changing verification-owned data are distinct operations:
+
+- changing the descriptor replaces the execution implementation, authority type, or verification implementation pointer;
+- changing verification-owned data adds or revokes actors, rotates a stateful root, changes a threshold, updates expiry, or modifies another authority parameter without changing the descriptor.
+
+Both operations are authorized by the current authority path and use the same `CONFIGURE` frame and `APPROVE_CONFIGURE` action.
 
 ## Specification
 
@@ -88,9 +100,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | `ROOT_VERIFY_DATA_LENGTH` | `4` |
 | `CONFIGURE_MODE` | `0x03` |
 | `CONFIGURE_LENGTH_BYTES` | `2` |
-| `CONFIGURE_SUCCESS` | `keccak256("STRUCTURED_ACCOUNT_CONFIGURE_SUCCESS")` |
+| `NO_DESCRIPTOR_CHANGE` | `0x0000` |
+| `APPROVE_CONFIGURE` | `0x10` |
 | `STRUCTURED_VERIFY_BASE_GAS` | `500` |
 | `CONFIGURE_BASE_GAS` | `5000` |
+
+`APPROVE_CONFIGURE` is an `APPROVE` operand used only in `CONFIGURE` mode. It is not part of `APPROVE_SCOPE_MASK` and is not encoded in `frame.flags`.
 
 The gas values are provisional pending client benchmarks.
 
@@ -222,6 +237,8 @@ def authorize_inline_root(descriptor, auth_result):
     )
 ```
 
+An `INLINE_ROOT` account has no implementation-defined mutable authority state. Its root or execution implementation is changed by replacing the descriptor.
+
 ### Authority type `0x01`: verification implementation
 
 A verification-implementation account has exactly 43 bytes of code:
@@ -266,27 +283,38 @@ The base protocol assigns no ABI, calldata format, storage layout, actor mapping
 
 Structured account code is recognized before EIP-7702 delegation handling.
 
-For a frame whose `resolved_target` is a structured account:
+Frame dispatch is extended as follows:
 
 ```python
-if frame.mode == VERIFY:
-    if descriptor.authority_type == INLINE_ROOT:
-        execute_inline_root_verify(frame, descriptor)
-    elif descriptor.authority_type == VERIFY_IMPLEMENTATION:
-        execute_verification_implementation(frame, descriptor)
+current_descriptor = (
+    parse_structured_account(state[resolved_target].code)
+    if is_structured_account(resolved_target)
+    else None
+)
 
-elif frame.mode == CONFIGURE:
-    execute_structured_configure(frame, descriptor)
+if frame.mode == CONFIGURE:
+    execute_structured_configure(frame, current_descriptor)
+
+elif current_descriptor is not None:
+    if frame.mode == VERIFY:
+        if current_descriptor.authority_type == INLINE_ROOT:
+            execute_inline_root_verify(frame, current_descriptor)
+        elif current_descriptor.authority_type == VERIFY_IMPLEMENTATION:
+            execute_verification_implementation(
+                frame, current_descriptor, static=True
+            )
+    else:
+        execute_execution_implementation(frame, current_descriptor)
 
 else:
-    execute_execution_implementation(frame, descriptor)
+    execute_existing_eip8141_dispatch(frame)
 ```
 
 This is protocol code selection analogous to EIP-7702 delegated-code dispatch. It is not execution of the `DELEGATECALL` opcode and does not create an additional EVM call frame.
 
 The code bytes are loaded directly from the selected implementation address without recursively resolving an EIP-7702 indicator or another structured descriptor at that address.
 
-While the current frame mode is `VERIFY` or `CONFIGURE`, a nested code-executing operation targeting that frame's `resolved_target` MUST select the same verification implementation rather than the execution implementation. This prevents a self-call from switching the validation path into arbitrary wallet execution code.
+While the current frame mode is `VERIFY` or `CONFIGURE`, a nested code-executing operation targeting that frame's `resolved_target` MUST select the same verification implementation rather than the execution implementation. This prevents a self-call from switching the authority path into arbitrary wallet execution code.
 
 ### Account-context verification
 
@@ -325,7 +353,7 @@ A verification implementation MAY:
 - call external authority contracts; and
 - invoke `APPROVE` after authorization succeeds.
 
-The frame remains subject to EIP-8141 `VERIFY` semantics. Revert, exceptional halt, or failure to invoke the required approval makes the frame transaction invalid. The approved scope MUST be permitted by `frame.flags`.
+The frame remains subject to EIP-8141 `VERIFY` semantics. Revert, exceptional halt, or failure to invoke the required approval makes the frame transaction invalid. The approved execution/payment scope MUST be permitted by `frame.flags`.
 
 A minimal EIP-8130-style adapter can perform:
 
@@ -373,13 +401,34 @@ APPROVE(frame.flags & APPROVE_SCOPE_MASK)
 
 No verification or execution implementation bytecode runs.
 
+### `APPROVE_CONFIGURE`
+
+This proposal extends the EIP-8141 `APPROVE` instruction with the mode-specific operand `APPROVE_CONFIGURE`.
+
+Existing `APPROVE_PAYMENT`, `APPROVE_EXECUTION`, and `APPROVE_EXECUTION_AND_PAYMENT` behavior is unchanged in `VERIFY` mode. `APPROVE_CONFIGURE` is invalid in `VERIFY`, `DEFAULT`, and `SENDER` modes.
+
+When `APPROVE` is executed with `scope == APPROVE_CONFIGURE` in a `CONFIGURE` frame:
+
+1. If `ADDRESS != resolved_target`, revert the current call frame.
+2. If `resolved_target != tx.sender`, revert the current call frame.
+3. If `payer == None`, revert the current call frame.
+4. If `frame.flags & APPROVE_SCOPE_MASK != 0`, revert the current call frame.
+5. If the opcode is not executed in the top-level EVM call frame created for the `CONFIGURE` frame, revert the current call frame.
+6. If the current `CONFIGURE` frame has already been approved, revert the current call frame.
+7. Mark the current configuration as approved.
+8. Terminate the top-level configuration call frame successfully, using the `offset` and `length` operands as return data exactly as existing `APPROVE` does.
+
+`APPROVE_CONFIGURE` does not set `sender_approved`, does not select or change `payer`, does not increment a nonce, and does not collect additional maximum cost.
+
+`APPROVE_CONFIGURE` is permitted in a `CONFIGURE` frame carrying `ATOMIC_BATCH_FLAG`. Existing execution/payment approvals remain unavailable inside an atomic batch. Configuration state and descriptor changes are journaled and revert if the atomic batch is later unrolled.
+
 ### `CONFIGURE` frame
 
 EIP-8141's frame mode table is extended with:
 
 | `mode` | Name | Summary |
 |---|---|---|
-| `0x03` | `CONFIGURE` | install or replace a structured descriptor after authorization by the current account model |
+| `0x03` | `CONFIGURE` | mutate verification-owned authority state and optionally install or replace a structured descriptor |
 
 The static frame constraint becomes:
 
@@ -387,15 +436,17 @@ The static frame constraint becomes:
 assert frame.mode < 4
 ```
 
-A `CONFIGURE` frame targets `tx.sender`, carries no value or approval scope, and requires transaction payment to have already been established. The atomic-batch flag is permitted.
+A `CONFIGURE` frame targets `tx.sender`, carries no value or execution/payment approval scope, and requires transaction payment to have already been established. The atomic-batch flag is permitted.
 
 Its data is:
 
 ```text
 new_descriptor_length   (2 bytes, uint16 big-endian)
-new_descriptor          (new_descriptor_length bytes)
-authorization_data      (remaining bytes)
+new_descriptor          (new_descriptor_length bytes; omitted when length is zero)
+configuration_data      (remaining bytes, authority-implementation-defined)
 ```
+
+`new_descriptor_length == NO_DESCRIPTOR_CHANGE` means the descriptor remains unchanged. A nonzero length requests descriptor installation or replacement and MUST identify one complete valid structured descriptor.
 
 The frame is structurally valid only when:
 
@@ -404,37 +455,124 @@ The frame is structurally valid only when:
 3. `frame.flags & APPROVE_SCOPE_MASK == 0`.
 4. no undefined flag bit is set.
 5. `frame.value == 0`.
-6. `new_descriptor` parses under an active authority type.
+6. a nonzero `new_descriptor_length` fits within `frame.data` and the selected bytes parse under an active authority type.
 7. at most one `CONFIGURE` frame appears in the transaction.
 8. no `SENDER` frame precedes it.
 
-Authorization uses the current account model, not the proposed descriptor.
+At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame. A `CONFIGURE` frame succeeds only through `APPROVE_CONFIGURE` or one of the direct protocol paths defined below. Returning or stopping normally without approval is a failed configuration and rolls back to the frame-entry checkpoint. Revert or exceptional halt has the same rollback effect.
 
-#### Installing from an unstructured account
+#### Configuration class 1: authority-state update
+
+When `new_descriptor_length == 0`, the descriptor is not changed.
+
+This form is valid only when the current account is a structured `VERIFY_IMPLEMENTATION` account. The current verification implementation executes in account context with:
+
+| Property | Value |
+|---|---|
+| code source | current `verification_implementation` |
+| `ADDRESS` | structured account |
+| calldata | complete `frame.data`, unchanged |
+| static mode | disabled |
+| frame mode | `CONFIGURE_MODE` |
+| gas pools | frame-declared EIP-8141 limits |
+
+The implementation authenticates the current root, admin, recovery path, multisig, or other authority according to its own rules; mutates its chosen authority state; and finally invokes `APPROVE(APPROVE_CONFIGURE)`.
+
+The mutable state may be:
+
+- structured-account storage;
+- storage at a deterministic per-account authority contract;
+- a shared keystore mapping;
+- another external authority service; or
+- any other state selected by the verification implementation.
+
+For example, this form can add or revoke a session actor, rotate a stateful root, change an expiry, update a threshold, or modify a recovery configuration without changing the descriptor.
+
+All writes and external calls occur before `APPROVE_CONFIGURE`. Because `APPROVE_CONFIGURE` is restricted to and terminates the top-level configuration call frame, no configuration write can occur after approval. If approval is never reached, all provisional state changes are rolled back. A delegated library may assist the check or mutation, but it must return to the top-level verification implementation, which performs the final `APPROVE_CONFIGURE`.
+
+#### Configuration class 2: descriptor update
+
+When `new_descriptor_length > 0`, the indicated descriptor is installed or replaces the current descriptor after authorization.
+
+If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context described above. It MAY also mutate verification-owned state before calling `APPROVE_CONFIGURE`. On approval, both the state mutations and descriptor replacement commit. This permits one frame to migrate authority data and switch verification implementations atomically.
+
+If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index. The referenced canonical-hash signature MUST produce an `AuthenticationResult` matching the current inline root. The protocol then applies the effects equivalent to a successful `APPROVE(APPROVE_CONFIGURE)` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
 
 If `tx.sender` is not yet structured:
 
 - `sender_approved` MUST already be true;
-- `authorization_data` MUST be empty; and
-- the prior EIP-8141 validation path is treated as authorization to install the descriptor.
+- `configuration_data` MUST be empty; and
+- the prior EIP-8141 validation path authorizes installation.
 
-The canonical transaction signing hash commits to the complete frame list and proposed descriptor. A code-less sender may therefore install structured authority after default-account approval, and a frame-aware smart account may migrate after its existing validation code approves the transaction.
+The protocol applies the effects equivalent to a successful `APPROVE(APPROVE_CONFIGURE)` and installs the descriptor. An account that cannot yet approve an EIP-8141 frame transaction requires an account-specific migration path outside this proposal.
 
-An existing account that cannot yet send EIP-8141 frame transactions requires an account-specific upgrade or migration path outside this proposal.
+#### Applying configuration
 
-#### Replacing an inline-root descriptor
+For a `VERIFY_IMPLEMENTATION` account, the current descriptor always determines which verification code authorizes the frame. The proposed descriptor is never used for authorization before installation.
 
-For `INLINE_ROOT`, `authorization_data` is one 4-byte signature index. The referenced canonical-hash signature MUST produce an `AuthenticationResult` matching the current inline root.
+Conceptually:
 
-#### Replacing a verification-implementation descriptor
+```python
+def execute_structured_configure(frame, current_descriptor, tx, state):
+    assert resolved_target(frame) == tx.sender
+    assert payer is not None
+    assert frame.flags & APPROVE_SCOPE_MASK == 0
+    assert frame.value == 0
 
-For `VERIFY_IMPLEMENTATION`, the current verification implementation executes in account context under `CONFIGURE_MODE`, static mode, and the complete `frame.data` calldata.
+    new_len = int.from_bytes(frame.data[0:2], "big")
+    assert 2 + new_len <= len(frame.data)
 
-It may perform a root, admin, recovery, multisig, or keystore check. Authorization succeeds only when top-level execution returns exactly 32 bytes equal to `CONFIGURE_SUCCESS`.
+    new_descriptor = None
+    if new_len != 0:
+        new_descriptor = frame.data[2:2 + new_len]
+        parse_structured_account(new_descriptor)
 
-`APPROVE` is invalid in `CONFIGURE` because the frame declares no approval scope. The verification implementation MUST bind its success to the exact new descriptor and any account, chain, nonce, or replay domain required by its authority model.
+    configuration_data = frame.data[2 + new_len:]
+    checkpoint = state.checkpoint()
 
-On success, protocol replaces `tx.sender` code with `new_descriptor`. The new descriptor is immediately visible to later frames and follows ordinary frame and atomic-batch rollback semantics.
+    if current_descriptor is None:
+        assert new_descriptor is not None
+        assert sender_approved
+        assert len(configuration_data) == 0
+        configuration_approved = True
+
+    elif current_descriptor.authority_type == INLINE_ROOT:
+        assert new_descriptor is not None
+        assert len(configuration_data) == 4
+        sig = tx.signatures[int.from_bytes(configuration_data, "big")]
+        assert len(sig.msg) == 0
+        assert authorize_inline_root(
+            current_descriptor,
+            AuthenticationResult(sig.verifier, sig.key_id),
+        )
+        configuration_approved = True
+
+    elif current_descriptor.authority_type == VERIFY_IMPLEMENTATION:
+        configuration_approved = execute_current_verification_implementation(
+            mode=CONFIGURE_MODE,
+            static=False,
+            calldata=frame.data,
+            success_condition=APPROVE_CONFIGURE,
+        )
+
+    if not configuration_approved:
+        state.revert(checkpoint)
+        return FRAME_FAILURE
+
+    if new_descriptor is not None:
+        charge_descriptor_write(new_descriptor)
+        state[tx.sender].code = new_descriptor
+
+    return FRAME_SUCCESS
+```
+
+If descriptor-write charging fails, the complete `CONFIGURE` frame fails and reverts to the frame-entry checkpoint, including any verification-owned state mutations performed before `APPROVE_CONFIGURE`.
+
+The complete configuration frame is committed by the canonical transaction signature whenever the selected authority uses an EIP-8141 signature with empty `msg`. A verification implementation using another authorization message MUST bind approval to all configuration data it considers security-critical, including the exact descriptor when present, account, chain or replay domain, and update nonce or sequence.
+
+A descriptor update and authority-state update MAY occur in the same `VERIFY_IMPLEMENTATION` configuration frame. A failed later frame in the same atomic batch reverts both.
+
+An `INLINE_ROOT -> VERIFY_IMPLEMENTATION` transition does not itself execute the newly selected verification implementation. If the destination implementation requires mutable authority state, that state must already be initialized or a companion profile must define a bootstrap procedure authorized by the inline root.
 
 ### Ordinary execution
 
@@ -472,9 +610,11 @@ STRUCTURED_VERIFY_BASE_GAS
 
 Verification-implementation authorization uses the frame's ordinary EIP-8141 execution-gas budget. Resolving `verification_implementation` charges the applicable warm or cold account/code access cost analogously to EIP-7702 code resolution. Calls and storage reads made by verification code are charged through normal EVM rules.
 
-A direct evaluator MUST reproduce equivalent EVM gas, warmness, returndata, failure behavior, and approval effects. Direct evaluation is an optimization, not a repricing.
+`CONFIGURE` runs non-statically for `VERIFY_IMPLEMENTATION` and may consume both execution and state gas. All calls, storage writes, account creation, logs, and external effects are charged normally. `CONFIGURE_BASE_GAS` additionally covers configuration dispatch and optional descriptor replacement bookkeeping.
 
-`CONFIGURE` charges `CONFIGURE_BASE_GAS`, any current-authority verification cost, and the active code-write or state-growth charge for the new descriptor.
+`APPROVE_CONFIGURE` has the same memory-expansion and return-data cost behavior as existing `APPROVE`. It has no additional execution-gas base cost.
+
+A direct evaluator MUST reproduce equivalent EVM gas, warmness, returndata, state effects, failure behavior, and approval effects. Direct evaluation is an optimization, not a repricing.
 
 ### Public mempool
 
@@ -490,7 +630,7 @@ A profile MAY provide an equivalent direct evaluator. The current runtime code h
 
 A verification implementation that calls an external keystore may be block-valid while failing the generic EIP-8141 public-mempool rule against external mutable storage. A companion profile or public-mempool EIP may admit the exact bounded external dependencies of a canonical actor-authority implementation.
 
-Because `CONFIGURE` requires `payer != None`, descriptor installation and replacement occur outside the public-mempool validation prefix.
+`CONFIGURE` requires `payer != None`; it is therefore outside the public-mempool validation prefix. Its non-static authority-state mutation does not expand public-mempool admission work. Builders and block validators still execute it under ordinary consensus rules.
 
 ## Out of Scope
 
@@ -521,13 +661,17 @@ For L1/L2 public-mempool interoperability it must also specify the bounded state
 
 The descriptor stores an address rather than an expected runtime code hash. An implementation change at the same address changes authority semantics without changing the account descriptor. Immutable deployments are recommended; a later authority type may pin a code hash.
 
+### Bootstrap into stateful verification
+
+`VERIFY_IMPLEMENTATION` can update its own authority data once it is active. A direct transition from `INLINE_ROOT` or an unstructured account to a verification implementation with uninitialized account-local authority data can lock the account. A companion profile may define pre-initialized external authority, deterministic initialization, or a root-authorized bootstrap call to the destination verification implementation.
+
 ### Existing non-frame accounts
 
 `CONFIGURE` can migrate code-less accounts and smart accounts that already support EIP-8141 validation. ERC-4337-only accounts that cannot approve a frame transaction still need an implementation-specific upgrade or migration path.
 
 ### Pre-validation authority changes
 
-The current model validates existing authority before applying paid configuration. Atomic rotation and action are possible under the old authority, but first-use by a newly installed key and pre-validation actor changes require a separate construction.
+Configuration occurs after payment and is authorized by existing authority. Atomic rotation and action are possible under the old authority, but first-use by a newly installed actor in the same transaction requires a separate construction.
 
 ### Validation gas budget
 
@@ -573,13 +717,27 @@ Core protocol forwards `frame.data` unchanged. ABI knowledge belongs to the sele
 
 A simple account should not pay an external call and storage lookup merely to represent one ultimate key. `INLINE_ROOT` is the one-entry specialization of the same `(verifier, key_id) -> authority` model used by richer implementations.
 
+### Why configuration uses `APPROVE`
+
+`CONFIGURE_SUCCESS` would create a second signaling convention alongside EIP-8141 `APPROVE`. `APPROVE_CONFIGURE` keeps every account-context authorization result on one protocol channel.
+
+The action is mode-specific rather than an execution/payment frame flag. This prevents a session actor's ability to approve execution from automatically implying descriptor or authority-state administration.
+
+### Why configuration is non-static
+
+Descriptor replacement alone needs only a protocol code update, but verification-owned data may live in account storage or an external keystore. Supporting actor addition, revocation, root rotation, and recovery updates therefore requires state changes.
+
+A `CONFIGURE` frame runs only after payment has been established. Its state changes remain provisional until current authority reaches `APPROVE_CONFIGURE`, and they are rolled back otherwise.
+
+### Why zero descriptor length means state-only configuration
+
+The descriptor is optional because many authority updates do not change code identity. Requiring a redundant descriptor rewrite for every session-key or expiry update would add data and state churn.
+
+A nonzero length supports descriptor-only and combined descriptor-plus-state migration in the same frame.
+
 ### Why signatures remain in the EIP-8141 list
 
 The signature list provides one location for protocol validation, witness elision, future aggregation, and signatures consumed during ordinary execution. Structured authority changes how authenticated results are authorized; it does not create a second signature container.
-
-### Why configuration has a separate success result
-
-Execution or payment approval does not imply root or recovery authority. A session actor may approve execution but must not necessarily replace the account descriptor. `CONFIGURE_SUCCESS` lets the current verification implementation apply its own admin or recovery rules without adding keystore-specific scopes to core protocol.
 
 ### Validation after execution
 
@@ -587,11 +745,11 @@ Account authority must be established before a `SENDER` frame. Post-execution as
 
 ## Backwards Compatibility
 
-This proposal requires a network upgrade because it assigns special semantics to `0xef02`, extends EIP-8141 signature introspection, and adds a frame mode.
+This proposal requires a network upgrade because it assigns special semantics to `0xef02`, extends EIP-8141 signature introspection and `APPROVE`, and adds a frame mode.
 
 EIP-3541 prevents newly deployed ordinary code beginning with `0xef`, so existing deployable EVM contracts are not reinterpreted as structured accounts.
 
-Pre-upgrade clients reject structured descriptors and do not understand the new signature attributes or `CONFIGURE` mode.
+Pre-upgrade clients reject structured descriptors and do not understand the new signature attributes, `CONFIGURE` mode, or `APPROVE_CONFIGURE` action.
 
 ## Test Cases
 
@@ -627,20 +785,42 @@ Implementations MUST cover at least the following cases.
 4. Confirm `CODESIZE` sees verification code and `EXTCODESIZE(ADDRESS)` sees the 43-byte descriptor.
 5. Confirm a direct `SLOAD` reads structured-account storage, not storage at the verification implementation address.
 6. Confirm a nested call to the same structured account remains on the verification path.
-7. Confirm an external authority contract cannot invoke `APPROVE` for the account.
+7. Confirm an external authority contract cannot invoke execution/payment `APPROVE` for the account.
 8. Confirm verification code can validate the external result and invoke `APPROVE` itself.
 9. Confirm ordinary `SENDER` execution uses `execution_implementation` rather than verification code.
 
-### Configuration
+### `APPROVE_CONFIGURE`
+
+1. Accept `APPROVE_CONFIGURE` only in `CONFIGURE` mode with `ADDRESS == resolved_target == tx.sender` and an established payer.
+2. Reject it in `VERIFY`, `DEFAULT`, and `SENDER` modes.
+3. Reject execution/payment approval operands in `CONFIGURE` mode.
+4. Confirm it does not alter `sender_approved`, payer, nonce, or maximum-cost collection.
+5. Confirm the opcode terminates the top-level configuration call frame successfully.
+6. Reject `APPROVE_CONFIGURE` from a nested `CALL`, `DELEGATECALL`, or `CALLCODE` frame.
+7. Confirm a normal return without `APPROVE_CONFIGURE` rolls back all configuration state changes.
+8. Confirm `APPROVE_CONFIGURE` can be used in an atomic batch and is rolled back if the batch later fails.
+
+### Authority-state configuration
+
+1. Use `new_descriptor_length == 0` to add an actor in structured-account storage and keep the descriptor unchanged.
+2. Use the same form to update a deterministic per-account authority contract.
+3. Use the same form to update a shared keystore entry.
+4. Perform writes and then return without approval; confirm every write is rolled back.
+5. Perform external state changes and then revert; confirm all effects are rolled back.
+6. Reject state-only configuration for `INLINE_ROOT` and unstructured accounts.
+
+### Descriptor configuration
 
 1. Install structured authority from a code-less account after default-account approval and payment.
 2. Install it from an unstructured frame-aware smart account after its existing validation approves the transaction.
 3. Rotate an inline root with a canonical-hash signature from the current root.
 4. Switch from inline root to verification implementation.
-5. Authorize replacement through the current verification implementation and return `CONFIGURE_SUCCESS`.
-6. Reject a configuration result not bound to the exact proposed descriptor.
-7. Roll back configuration with a failed atomic batch.
-8. Keep a successful non-atomic configuration when a later independent frame fails.
+5. Replace the execution implementation through the current verification implementation.
+6. Replace the verification implementation after current-authority approval.
+7. Mutate current authority state and replace the descriptor in one frame; confirm both commit together.
+8. Fail before `APPROVE_CONFIGURE`; confirm both state and descriptor remain unchanged.
+9. Roll back state and descriptor with a failed atomic batch.
+10. Keep a successful non-atomic configuration when a later independent frame fails.
 
 ### Public mempool
 
@@ -660,7 +840,13 @@ Implementations MUST cover at least the following cases.
 
 ### Verification implementation is authority code
 
-A verification implementation decides whether `APPROVE` or configuration succeeds. A bug that ignores the transaction hash, misparses a key ID, trusts an unauthenticated external result, or grants excessive scope compromises every account using it.
+A verification implementation decides whether execution/payment approval or configuration succeeds. A bug that ignores the transaction hash, misparses a key ID, trusts an unauthenticated external result, or grants excessive authority compromises every account using it.
+
+### Non-static configuration
+
+`CONFIGURE` permits current verification code to write account state and call state-changing external contracts before invoking `APPROVE_CONFIGURE`. These effects commit when configuration is approved.
+
+This does not grant more authority than an approved account execution, but it makes the verification implementation's configuration path security-critical. Implementations SHOULD minimize configuration call targets and MUST ensure only the intended current root, administrator, recovery path, or threshold can reach `APPROVE_CONFIGURE`.
 
 ### Authority storage is implementation-defined
 
@@ -672,7 +858,7 @@ The descriptor names an address rather than a code hash. Code changes at that ad
 
 ### Transitive code execution
 
-Code reached through `DELEGATECALL` or `CALLCODE` runs with the structured account address and may invoke `APPROVE`. A chain recognizing only the top-level code hash must ensure that the selected implementation's transitive behavior satisfies its admission policy.
+Code reached through `DELEGATECALL` or `CALLCODE` runs with the structured account address and can mutate configuration state or influence the final authorization result. It cannot directly complete configuration because `APPROVE_CONFIGURE` is restricted to the top-level configuration call frame, but it remains part of the authority implementation's trust boundary. A chain recognizing only the top-level code hash must ensure that the selected implementation's transitive behavior satisfies its admission and security policy.
 
 ### External authority contracts
 
@@ -680,11 +866,19 @@ An external keystore or authority service cannot approve directly, but a malicio
 
 ### Opaque calldata
 
-Core protocol does not parse `frame.data` for `VERIFY_IMPLEMENTATION`. Wallets and explorers need a parser associated with the selected implementation or profile. Unknown verification code must not be decoded under another implementation's ABI.
+Core protocol does not parse `configuration_data` or ordinary `VERIFY_IMPLEMENTATION` frame data. Wallets and explorers need a parser associated with the selected implementation or profile. Unknown verification code must not be decoded under another implementation's ABI.
 
-### Configuration authorization
+### Configuration authorization binding
 
-`CONFIGURE_SUCCESS` must be returned only after authorization commits to the exact new descriptor and any required account, chain, nonce, and replay domain. Detached or weakly bound admin signatures may permit replay or descriptor substitution.
+A verification implementation must invoke `APPROVE_CONFIGURE` only after authorization is bound to every security-critical field. For descriptor updates this includes the exact new descriptor. For authority-state updates it includes the exact mutation payload. Account, chain or replay domain, and update nonce or sequence must be included where required by the authority model.
+
+### Configuration ordering
+
+A successful non-atomic configuration remains applied if a later independent frame fails. Wallets requiring configuration and subsequent execution to be all-or-nothing MUST place them in the same atomic batch.
+
+### Bootstrap lockout
+
+Installing a stateful verification implementation without initialized authority state may permanently lock the account. Wallets must initialize the destination authority first or use a standardized bootstrap profile.
 
 ### Legacy signatures
 
@@ -692,7 +886,7 @@ Installing structured authority disables legacy transaction origination but does
 
 ### Client consistency
 
-Clients must agree on descriptor parsing, authentication-result derivation, mode-sensitive code selection, account-context execution, `APPROVE` caller checks, configuration behavior, gas accounting, and rollback semantics. Divergence is consensus-critical.
+Clients must agree on descriptor parsing, authentication-result derivation, mode-sensitive code selection, account-context execution, `APPROVE_CONFIGURE` behavior, provisional configuration state, descriptor replacement, gas accounting, and rollback semantics. Divergence is consensus-critical.
 
 ## Copyright
 
