@@ -720,7 +720,7 @@ The complete configuration frame is committed by the canonical transaction signa
 
 A descriptor update and authority-state update MAY occur in the same `VERIFY_IMPLEMENTATION` configuration frame.
 
-An `INLINE_ROOT -> VERIFY_IMPLEMENTATION` transition does not itself execute the newly selected verification implementation. If the destination implementation requires mutable authority state, that state must already be initialized or a companion profile must define a bootstrap procedure authorized by the inline root.
+An `INLINE_ROOT -> VERIFY_IMPLEMENTATION` transition does not itself execute the newly selected verification implementation; this proposal never executes a proposed implementation before installation. If the destination implementation requires mutable authority state, that state MUST already be initialized before installation, or a companion profile MUST define the bootstrap procedure.
 
 ### Install and first use in one transaction
 
@@ -751,6 +751,45 @@ frame 3: SENDER
 [EIP-8141](./eip-8141.md) authenticates both protocol-validated signatures before frame execution. This does not authorize the new credential early; it only establishes the credential identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
 
 If any of frames 0 through 2 fails, no payer is established, or another validation failure makes the transaction invalid, the authorization installation is reverted.
+
+### Migration examples
+
+The following flows are illustrative.
+
+Code-less account to `INLINE_ROOT`, with first use by the new root:
+
+```text
+signatures[0] = account key signs compute_configure_hash(tx)
+signatures[1] = new root credential signs canonical transaction hash
+
+frame 0: CONFIGURE
+    direct protocol path checks signatures[0]
+    installs the 0xef0200 descriptor
+
+frame 1: VERIFY
+    inline root matches signatures[1].(verifier, key_id)
+    APPROVE_EXECUTION_AND_PAYMENT
+
+frame 2: SENDER
+    ordinary execution
+```
+
+[EIP-7702](./eip-7702.md) account to a structured account, keeping the current wallet:
+
+```text
+current code:   0xef0100 || delegation_target
+new descriptor: execution_implementation = delegation_target
+                plus the chosen authority payload
+
+signatures[0] = account key signs compute_configure_hash(tx)
+signatures[1] = new credential signs canonical transaction hash
+
+frame 0: CONFIGURE   direct protocol path replaces the indicator
+frame 1: VERIFY      new authority approves execution and payment
+frame 2: SENDER      existing wallet logic continues unchanged
+```
+
+Because both models execute implementation code with the account's address and storage as context, the existing delegation target usually carries over directly as `execution_implementation`. Address, balance, nonce sequence, storage, and application approvals are preserved; legacy ECDSA origination and further [EIP-7702](./eip-7702.md) delegation are disabled after installation. Wallet code that inspects its own account's code bytes will observe the structured descriptor rather than a delegation indicator and needs compatibility review, and the chosen verification implementation must avoid storage collisions with existing wallet state or use an external authority backend.
 
 ### Ordinary execution
 
@@ -955,7 +994,7 @@ The descriptor stores an address rather than an expected runtime code hash. An i
 
 #### Existing non-frame accounts
 
-`CONFIGURE` can migrate code-less accounts and smart accounts that already support [EIP-8141](./eip-8141.md) validation. [ERC-4337](./eip-4337.md)-only accounts that cannot approve a frame transaction still need an implementation-specific upgrade or migration path.
+`CONFIGURE` can migrate code-less accounts and smart accounts that already support [EIP-8141](./eip-8141.md) validation. Upgradeable [ERC-4337](./eip-4337.md)-only accounts need a bridge step first: an upgrade installing logic that can approve `APPROVE_CONFIGURE`. An immutable smart account that cannot originate a frame transaction, cannot approve `APPROVE_CONFIGURE`, and has no upgrade or module path cannot migrate under this proposal; only a companion migration primitive (for example a one-way self-migration instruction) could serve it.
 
 #### Validation gas budget
 
@@ -1053,6 +1092,8 @@ Implementations MUST cover at least the following cases.
 2. Install over an [EIP-7702](./eip-7702.md) delegation indicator with the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`.
 3. Reject direct installation on an account with contract code; require a configure approval from that account's own `VERIFY` frame.
 4. Reject installation on a smart account whose transaction was execution-approved by a restricted credential and whose code does not approve configuration.
+5. Migrate a code-less account and approve execution and payment with the new root in the same transaction; a failed new-root `VERIFY` reverts the installation.
+6. Migrate an [EIP-7702](./eip-7702.md) account reusing the delegation target as `execution_implementation`; storage and balance are unchanged, and both legacy origination and new delegation are rejected afterward.
 
 ### Descriptor configuration
 
