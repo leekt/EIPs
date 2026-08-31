@@ -518,7 +518,7 @@ When `new_descriptor_length > 0`, the indicated descriptor is installed or repla
 
 If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before calling `APPROVE_CONFIGURE`. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
 
-If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index. The referenced canonical-hash signature MUST produce an `AuthenticationResult` matching the current inline root. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
+If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. An out-of-bounds index or an entry that does not produce an `AuthenticationResult` is a configuration failure. The referenced canonical-hash signature MUST produce an `AuthenticationResult` matching the current inline root. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
 
 If `tx.sender` is not yet structured:
 
@@ -562,8 +562,11 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     elif current_descriptor.authority_type == INLINE_ROOT:
         assert new_descriptor is not None
         assert len(configuration_data) == 4
-        sig = tx.signatures[int.from_bytes(configuration_data, "big")]
+        sig_index = int.from_bytes(configuration_data, "big")
+        assert sig_index < len(tx.signatures)
+        sig = tx.signatures[sig_index]
         assert len(sig.msg) == 0
+        assert produces_authentication_result(sig)
         assert authorize_inline_root(
             current_descriptor,
             AuthenticationResult(sig.verifier, sig.key_id),
