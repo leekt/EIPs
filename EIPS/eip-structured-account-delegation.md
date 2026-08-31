@@ -544,6 +544,8 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     if prepayment:
         assert not (frame.flags & ATOMIC_BATCH_FLAG)
 
+    charge_execution_gas(frame, CONFIGURE_BASE_GAS)
+
     new_len = int.from_bytes(frame.data[0:2], "big")
     assert 2 + new_len <= len(frame.data)
 
@@ -668,7 +670,7 @@ STRUCTURED_VERIFY_BASE_GAS
 
 Verification-implementation authorization uses the frame's ordinary EIP-8141 execution-gas budget. Resolving `verification_implementation` charges the applicable warm or cold account/code access cost analogously to EIP-7702 code resolution. Calls and storage reads made by verification code are charged through normal EVM rules.
 
-`CONFIGURE` runs non-statically for `VERIFY_IMPLEMENTATION` and may consume both execution and state gas. All calls, storage writes, account creation, logs, and external effects are charged normally. `CONFIGURE_BASE_GAS` additionally covers configuration dispatch and optional descriptor replacement bookkeeping.
+`CONFIGURE` runs non-statically for `VERIFY_IMPLEMENTATION` and may consume both execution and state gas. All calls, storage writes, account creation, logs, and external effects are charged normally. `CONFIGURE_BASE_GAS` additionally covers configuration dispatch and optional descriptor replacement bookkeeping. It is charged from the frame's `limits.execution` at frame entry, after the resolved-target account-access charge and before any verification-implementation code executes. A frame that cannot cover it fails exceptionally; before payer approval this makes the transaction invalid.
 
 `charge_descriptor_write` charges descriptor installation or replacement as state growth: `max(0, len(new_descriptor) - len(current_code)) * CPSB` is deducted from the frame's `state_gas_left` immediately before the code write, using the same per-state-byte accounting as EIP-8141's account-creation charge. A shrinking or equal-size replacement charges no growth. The dispatch cost of the write is covered by `CONFIGURE_BASE_GAS`; there is no separate per-byte execution-gas charge.
 
