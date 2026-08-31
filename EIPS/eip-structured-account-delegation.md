@@ -819,7 +819,7 @@ These features can be standardized independently without changing the structured
 
 ### Open questions
 
-### Canonical actor-authority profile
+#### Canonical actor-authority profile
 
 A shared production path for multi-actor accounts still requires agreement on at least one canonical verification implementation or profile. That profile may choose a shared keystore, deterministic per-account authority address, account-local storage, or another representation.
 
