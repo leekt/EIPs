@@ -732,51 +732,6 @@ A code hash identifies the initial verification bytecode. A no-tracing profile a
 
 The current runtime code hash at `verification_implementation` is always a validation dependency. Pending transactions MUST be revalidated when it changes.
 
-## Out of Scope
-
-This proposal intentionally does not define:
-
-- one mandatory keystore address or storage layout;
-- actor scopes, expiry packing, recovery, guardians, or session policy;
-- how a verification implementation stores or synchronizes authority state;
-- keyed or two-dimensional nonces;
-- nonce-free authorization;
-- signature aggregation algorithms;
-- public-key aliasing;
-- post-execution assertions or revert protection;
-- cross-chain authority synchronization; or
-- universal revocation of legacy `ECRECOVER`-based message authority.
-
-These features can be standardized independently without changing the structured account envelope.
-
-## Remaining Design Questions
-
-### Canonical actor-authority profile
-
-A shared production path for multi-actor accounts still requires agreement on at least one canonical verification implementation or profile. That profile may choose a shared keystore, deterministic per-account authority address, account-local storage, or another representation.
-
-For L1/L2 public-mempool interoperability it must specify bounded read and write dependencies, code hashes, pre-payment configuration semantics, and revalidation rules.
-
-### Verification implementation code identity
-
-The descriptor stores an address rather than an expected runtime code hash. An implementation change at the same address changes authority semantics without changing the account descriptor. Immutable deployments are recommended; a later authority type may pin a code hash.
-
-### Bootstrap into stateful verification
-
-`VERIFY_IMPLEMENTATION` can update its own authority data once active. A direct transition from `INLINE_ROOT` or an unstructured account to a verification implementation with uninitialized account-local authority data can lock the account. A companion profile may define pre-initialized external authority, deterministic initialization, or a root-authorized bootstrap call to the destination verification implementation.
-
-### Existing non-frame accounts
-
-`CONFIGURE` can migrate code-less accounts and smart accounts that already support EIP-8141 validation. ERC-4337-only accounts that cannot approve a frame transaction still need an implementation-specific upgrade or migration path.
-
-### Validation gas budget
-
-Pure authentication, pre-payment configuration, sender authorization, and payer authorization must fit the active EIP-8141 public-mempool validation budget. Expensive post-quantum verification or multiple custom authenticators may require separate authentication and authorization budgets or a larger cap.
-
-### Configuration and subsequent execution atomicity
-
-A pre-payment configuration is reverted if later validation fails or no payer is established. Once payment is approved, a later non-atomic execution-frame failure does not automatically revert the earlier configuration. Wallets that require configuration and business execution to commit together need a compatible atomic construction or a later transaction-level assertion.
-
 ## Rationale
 
 ### Why verification executes in account context
@@ -844,6 +799,51 @@ The signature list provides one location for protocol validation, witness elisio
 ### Validation after execution
 
 Account authority must be established before a `SENDER` frame. Post-execution assertions, zero-slippage protection, and similar revert-protection schemes are orthogonal and may be evaluated later where EIP-8141 ordering and public-mempool policy permit.
+
+### Scope boundaries
+
+This proposal intentionally does not define:
+
+- one mandatory keystore address or storage layout;
+- actor scopes, expiry packing, recovery, guardians, or session policy;
+- how a verification implementation stores or synchronizes authority state;
+- keyed or two-dimensional nonces;
+- nonce-free authorization;
+- signature aggregation algorithms;
+- public-key aliasing;
+- post-execution assertions or revert protection;
+- cross-chain authority synchronization; or
+- universal revocation of legacy `ECRECOVER`-based message authority.
+
+These features can be standardized independently without changing the structured account envelope.
+
+### Open questions
+
+### Canonical actor-authority profile
+
+A shared production path for multi-actor accounts still requires agreement on at least one canonical verification implementation or profile. That profile may choose a shared keystore, deterministic per-account authority address, account-local storage, or another representation.
+
+For L1/L2 public-mempool interoperability it must specify bounded read and write dependencies, code hashes, pre-payment configuration semantics, and revalidation rules.
+
+#### Verification implementation code identity
+
+The descriptor stores an address rather than an expected runtime code hash. An implementation change at the same address changes authority semantics without changing the account descriptor. Immutable deployments are recommended; a later authority type may pin a code hash.
+
+#### Bootstrap into stateful verification
+
+`VERIFY_IMPLEMENTATION` can update its own authority data once active. A direct transition from `INLINE_ROOT` or an unstructured account to a verification implementation with uninitialized account-local authority data can lock the account. A companion profile may define pre-initialized external authority, deterministic initialization, or a root-authorized bootstrap call to the destination verification implementation.
+
+#### Existing non-frame accounts
+
+`CONFIGURE` can migrate code-less accounts and smart accounts that already support EIP-8141 validation. ERC-4337-only accounts that cannot approve a frame transaction still need an implementation-specific upgrade or migration path.
+
+#### Validation gas budget
+
+Pure authentication, pre-payment configuration, sender authorization, and payer authorization must fit the active EIP-8141 public-mempool validation budget. Expensive post-quantum verification or multiple custom authenticators may require separate authentication and authorization budgets or a larger cap.
+
+#### Configuration and subsequent execution atomicity
+
+A pre-payment configuration is reverted if later validation fails or no payer is established. Once payment is approved, a later non-atomic execution-frame failure does not automatically revert the earlier configuration. Wallets that require configuration and business execution to commit together need a compatible atomic construction or a later transaction-level assertion.
 
 ## Backwards Compatibility
 
