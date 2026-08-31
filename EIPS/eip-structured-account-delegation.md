@@ -115,6 +115,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | `CONFIGURE_LENGTH_BYTES` | `2` |
 | `NO_DESCRIPTOR_CHANGE` | `0x0000` |
 | `APPROVE_CONFIGURE` | `0x8` |
+| `TXPARAM_CONFIGURE_HASH` | `0x0D` |
+| `CONFIGURE_HASH_DOMAIN` | `keccak256("STRUCTURED_ACCOUNT_CONFIGURE")` |
 | `EXTENDED_APPROVE_SCOPE_MASK` | `0xB` |
 | `STRUCTURED_VERIFY_BASE_GAS` | `500` |
 | `CONFIGURE_BASE_GAS` | `5000` |
@@ -417,6 +419,47 @@ APPROVE(frame.flags & APPROVE_SCOPE_MASK)
 ```
 
 No verification or execution implementation bytecode runs.
+
+### Canonical configuration hash
+
+The [EIP-8141](./eip-8141.md) `TXPARAM` table is extended with:
+
+| `param` | Return value |
+|---|---|
+| `0x0D` | `compute_configure_hash(tx)` |
+
+`TXPARAM(TXPARAM_CONFIGURE_HASH)` results in an exceptional halt when the transaction contains no `CONFIGURE` frame. At most one `CONFIGURE` frame exists per transaction (structural rule 6 below), so the value is transaction-scoped.
+
+```python
+def compute_configure_hash(tx):
+    configure_index = unique_configure_frame_index(tx)
+    return keccak256(
+        CONFIGURE_HASH_DOMAIN
+        + bytes([FRAME_TX_TYPE])
+        + rlp([
+            tx.chain_id,
+            tx.nonce,
+            tx.sender,
+            configure_index,
+            tx.frames[configure_index],
+        ])
+    )
+```
+
+The digest commits to the complete `CONFIGURE` frame -- mode, flags, target, gas limits, value, and data, including `new_descriptor` and `configuration_data` -- together with the chain, sender, sender nonce, and frame position. It intentionally does not commit to fees, the payer, other frames, or raw signature witnesses: a configuring authority can sign the configuration once while a relayer or sponsor independently constructs and re-prices the surrounding transaction, and inclusion of any transaction at that nonce retires the digest.
+
+A configuration authority may therefore use either signature form:
+
+- `sig.msg` empty -- the signature commits to the complete canonical frame transaction; or
+- `sig.msg == compute_configure_hash(tx)` -- the signature authorizes only the configuration.
+
+A configuration-only signature MUST NOT be used to authorize execution or payment. On the direct protocol paths this is protocol-enforced; a verification implementation MUST enforce it under its own policy, conceptually:
+
+```text
+require(SIGPARAM(0x02, i) == TXPARAM(TXPARAM_CONFIGURE_HASH))
+verify the configuring authority
+APPROVE(APPROVE_CONFIGURE)
+```
 
 ### `APPROVE_CONFIGURE`
 
@@ -966,6 +1009,14 @@ Implementations MUST cover at least the following cases.
 7. Confirm an external authority contract cannot invoke execution/payment `APPROVE` for the account.
 8. Confirm verification code can validate the external result and invoke `APPROVE` itself.
 9. Confirm ordinary `SENDER` execution uses `execution_implementation` rather than verification code.
+
+### Configuration hash
+
+1. `CONFIGURE_HASH` differs across chain IDs, senders, nonces, `CONFIGURE` frame positions, and any descriptor or configuration-payload change.
+2. `CONFIGURE_HASH` is unchanged when only fees or unrelated frames change.
+3. `TXPARAM(0x0D)` halts when the transaction has no `CONFIGURE` frame.
+4. A `CONFIGURE_HASH` signature licenses configuration on each direct protocol path and cannot approve execution or payment.
+5. A canonical transaction signature may authorize configuration combined with execution/payment scopes.
 
 ### `APPROVE_CONFIGURE`
 
