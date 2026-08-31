@@ -77,7 +77,7 @@ The core protocol deliberately does not select among those storage models. The s
 Configuration also needs the same separation. Changing the descriptor and changing verification-owned data are distinct operations:
 
 - changing the descriptor replaces the execution implementation, authority type, or verification implementation pointer;
-- changing verification-owned data adds or revokes actors, rotates a stateful root, changes a threshold, updates expiry, or modifies another authority parameter without changing the descriptor.
+- changing verification-owned data adds or revokes credentials, rotates a stateful root, changes a threshold, updates expiry, or modifies another authority parameter without changing the descriptor.
 
 Both operations are authorized by the current authority path and use the same `CONFIGURE` frame and `APPROVE_CONFIGURE` action.
 
@@ -286,7 +286,7 @@ The implementation decides where authority state lives. It MAY use, among other 
 
 - structured-account storage;
 - a deterministic per-account authority address;
-- a shared actor keystore;
+- a shared credential keystore;
 - immutable data embedded in code;
 - a committed root plus transaction proofs; or
 - no mutable state at all.
@@ -389,7 +389,7 @@ check authorization
 APPROVE(requested_scope)
 ```
 
-The authenticator remains stateless. It proves a credential and returns `actor_id`; the selected authority backend determines whether that actor may approve the requested action.
+The authenticator remains stateless. It proves a credential and returns `actor_id`; the selected authority backend determines whether that actor may approve the requested action. Interpreting the authenticated `key_id` as an actor identity is an [EIP-8130](./eip-8130.md)-style profile choice; the core protocol defines only the credential identity.
 
 ### Inline-root verification
 
@@ -530,7 +530,7 @@ The mutable state may be:
 - another external authority service; or
 - any other state selected by the verification implementation.
 
-This form can add or revoke an actor, rotate a stateful root, change expiry, update a threshold, or modify recovery configuration without changing the descriptor.
+This form can add or revoke a credential authorization, rotate a stateful root, change expiry, update a threshold, or modify recovery configuration without changing the descriptor.
 
 All writes and external calls occur before `APPROVE_CONFIGURE`. Because `APPROVE_CONFIGURE` terminates the top-level configuration call frame, no configuration write can occur after approval. If approval is never reached, all provisional effects are rolled back.
 
@@ -644,11 +644,11 @@ An `INLINE_ROOT -> VERIFY_IMPLEMENTATION` transition does not itself execute the
 
 ### Install and first use in one transaction
 
-A pre-payment `CONFIGURE` frame may install an actor that authorizes a later `VERIFY` frame in the same transaction.
+A pre-payment `CONFIGURE` frame may install a new authorization entry that authorizes a later `VERIFY` frame in the same transaction.
 
 ```text
 signatures[0] = current administrator signs canonical transaction hash
-signatures[1] = new actor signs canonical transaction hash
+signatures[1] = new credential holder signs canonical transaction hash
 
 frame 0: CONFIGURE
     current verification implementation authenticates signatures[0]
@@ -657,16 +657,16 @@ frame 0: CONFIGURE
 
 frame 1: VERIFY
     current verification implementation reads signatures[1]
-    observes the actor installed by frame 0
+    observes the authorization installed by frame 0
     APPROVE_EXECUTION_AND_PAYMENT
 
 frame 2: SENDER
     ordinary execution
 ```
 
-[EIP-8141](./eip-8141.md) authenticates both protocol-validated signatures before frame execution. This does not authorize the new actor early; it only establishes the actor identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
+[EIP-8141](./eip-8141.md) authenticates both protocol-validated signatures before frame execution. This does not authorize the new credential early; it only establishes the credential identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
 
-If frame 0 fails, frame 1 fails, no payer is established, or another validation failure makes the transaction invalid, the actor installation is reverted.
+If frame 0 fails, frame 1 fails, no payer is established, or another validation failure makes the transaction invalid, the authorization installation is reverted.
 
 ### Ordinary execution
 
@@ -784,15 +784,15 @@ Code-path separation and state-layout standardization are different questions. S
 
 The core EIP only needs a recognizable verification code source. The selected implementation and any public-mempool profile can define the storage model appropriate to that account class.
 
-### Why actor identity is separate from authenticator identity
+### Why credential identity is separate from verifier identity
 
-An authenticator address identifies a verification algorithm, not the particular key authorized by an account. Every user may share the same stateless P-256 authenticator. The authenticator therefore derives:
+A verifier address identifies a verification algorithm, not the particular key authorized by an account. Every user may share the same stateless P-256 verifier. The verifier therefore derives:
 
 ```text
 key_id = keccak256(qx || qy)
 ```
 
-and authorization binds the exact `(authenticator, key_id)` pair. `INLINE_ROOT` stores the pair directly; a richer verification implementation may look it up in an actor mapping.
+and authorization binds the exact `(verifier, key_id)` pair. `INLINE_ROOT` stores the pair directly; a richer verification implementation may look it up in an implementation-defined authority mapping. An [EIP-8130](./eip-8130.md)-style profile may interpret `key_id` as its actor identity.
 
 ### Why verifier code may be allowlisted
 
@@ -812,7 +812,7 @@ A simple account should not pay an external call and storage lookup merely to re
 
 A separate magic return value would create another signaling convention alongside [EIP-8141](./eip-8141.md) `APPROVE`. `APPROVE_CONFIGURE` keeps every account-context authorization result on one protocol channel.
 
-The action is mode-specific rather than an execution/payment frame flag. This prevents a session actor's ability to approve execution from automatically implying descriptor or authority-state administration.
+The action is mode-specific rather than an execution/payment frame flag. This prevents a session credential's ability to approve execution from automatically implying descriptor or authority-state administration.
 
 ### Why configuration may precede payment
 
@@ -855,9 +855,9 @@ These features can be standardized independently without changing the structured
 
 ### Open questions
 
-#### Canonical actor-authority profile
+#### Canonical verification profile
 
-A shared production path for multi-actor accounts still requires agreement on at least one canonical verification implementation or profile. That profile may choose a shared keystore, deterministic per-account authority address, account-local storage, or another representation.
+A shared production path for multi-credential accounts still requires agreement on at least one canonical verification implementation or profile. That profile may choose a shared keystore, deterministic per-account authority address, account-local storage, or another representation.
 
 For L1/L2 public-mempool interoperability it must specify bounded read and write dependencies, code hashes, pre-payment configuration semantics, and revalidation rules.
 
@@ -938,8 +938,8 @@ Implementations MUST cover at least the following cases.
 
 ### Pre-payment configuration
 
-1. Add a new actor under authorization from an existing administrator, then approve execution and payment with the new actor in a later `VERIFY` frame.
-2. Prevalidate both signatures before frame execution and confirm the new actor is not authorized until `CONFIGURE` succeeds.
+1. Add a new credential authorization under an existing administrator, then approve execution and payment with the new credential in a later `VERIFY` frame.
+2. Prevalidate both signatures before frame execution and confirm the new credential is not authorized until `CONFIGURE` succeeds.
 3. Fail configuration and confirm the transaction is invalid and all changes revert.
 4. Succeed in configuration but fail the later `VERIFY`; confirm all changes revert.
 5. Succeed in configuration but never establish a payer; confirm the transaction is invalid and all changes revert.
@@ -1021,6 +1021,8 @@ An external keystore or authority service cannot approve directly, but a malicio
 ### Configuration authorization binding
 
 A verification implementation must invoke `APPROVE_CONFIGURE` only after authorization is bound to every security-critical field. For descriptor updates this includes the exact new descriptor. For authority-state updates it includes the exact mutation payload. Account, chain or replay domain, and update nonce or sequence must be included where required by the authority model.
+
+A signature index alone MUST NOT be assumed to commit the configuring authority to signature-derived metadata. For the initial `SECP256K1` and `P256` schemes the entry's committed `signer` metadata fixes the credential, but a future scheme whose credential identifier travels in elided witness bytes could change `(verifier, key_id)` without changing the canonical transaction hash. A verification implementation that installs authorization derived from a referenced signature MUST bind the expected `verifier` and `key_id` into data its authorization covers.
 
 ### Configuration and execution atomicity
 
