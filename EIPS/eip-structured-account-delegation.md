@@ -7,7 +7,7 @@ status: Draft
 type: Standards Track
 category: Core
 created: 2026-08-28
-requires: 170, 2929, 3541, 3607, 7702, 7951, 8141, 8298, 8397
+requires: 170, 2929, 3541, 3607, 7702, 7951, 8141, 8298
 ---
 
 ## Abstract
@@ -141,19 +141,20 @@ The initial normalization rules are:
 |---|---|---|
 | EIP-8141 `SECP256K1` | `ECRECOVER_VERIFIER` | recovered address right-aligned in 32 bytes |
 | EIP-8141 `P256` | `P256_VERIFIER` | `keccak256(qx || qy)` |
-| EIP-8397 `AUTHENTICATOR` | authenticator address | authenticated EIP-8397 `key_id` |
+
+A future EIP defining an additional protocol-validated signature scheme MAY extend this table by specifying how the scheme derives its `AuthenticationResult` from the verified witness.
 
 For P-256, the full public key remains part of the opaque protocol-validated signature entry. Computing its identifier does not expose the raw witness to EVM code.
 
 An `ARBITRARY` signature entry does not produce an authenticated result. It may still be consumed through EIP-8141 `SIGDATACOPY`, but it cannot directly authorize `INLINE_ROOT`.
 
-A threshold, multisig, or other compound stateless credential MAY use:
+A future scheme proving a threshold, multisig, or other compound stateless credential SHOULD use:
 
 ```text
 key_id = keccak256(canonical credential configuration)
 ```
 
-provided the authenticator derives the value from the verified witness rather than trusting a transaction-supplied claim.
+provided the scheme derives the value from the verified witness rather than trusting a transaction-supplied claim.
 
 ### Signature entry attributes
 
@@ -168,7 +169,7 @@ The EIP-8141 `SIGPARAM` table is extended with:
 
 These values are defined only for signatures that produce an `AuthenticationResult`. Requesting either value for `ARBITRARY` results in an exceptional halt.
 
-For EIP-8397 `AUTHENTICATOR`, `SIGPARAM(0x04)` retains the EIP-8397 key identifier and `SIGPARAM(0x05)` returns the authenticator address. Existing EIP-8141 `resolved_signer` behavior is unchanged for backward compatibility.
+Existing EIP-8141 `resolved_signer` behavior is unchanged for backward compatibility.
 
 ### Structured account envelope
 
@@ -849,9 +850,8 @@ Implementations MUST cover at least the following cases.
 
 1. A secp256k1 signature exposes `verifier = address(0x01)` and the recovered address as `key_id`.
 2. A P-256 signature exposes `verifier = address(0x100)` and `keccak256(qx || qy)` as `key_id`.
-3. EIP-8397 exposes the authenticator address and returned key identifier.
-4. `SIGPARAM_KEY_ID` and `SIGPARAM_VERIFIER` halt for `ARBITRARY`.
-5. Raw P-256 witness bytes remain unavailable through `SIGDATACOPY`.
+3. `SIGPARAM_KEY_ID` and `SIGPARAM_VERIFIER` halt for `ARBITRARY`.
+4. Raw P-256 witness bytes remain unavailable through `SIGDATACOPY`.
 
 ### Descriptor parsing
 
@@ -864,8 +864,7 @@ Implementations MUST cover at least the following cases.
 
 1. Accept a matching `(verifier, key_id)` and requested approval scope.
 2. Reject the same key ID under another verifier.
-3. Accept a stateless multisig authenticator whose returned key ID commits to a canonical threshold configuration.
-4. Reject `ARBITRARY` as an inline-root credential.
+3. Reject `ARBITRARY` as an inline-root credential.
 
 ### Verification context
 
