@@ -411,6 +411,7 @@ It succeeds only when:
 5. The result matches the descriptor's `(verifier, key_id)`.
 6. The frame requests a nonzero [EIP-8141](./eip-8141.md) approval scope.
 7. Every ordinary [EIP-8141](./eip-8141.md) structural rule for that scope holds.
+8. `frame.flags & APPROVE_CONFIGURE == 0`. Inline-root configuration uses the direct protocol path, so the configure bit has no meaning here; its presence makes the transaction invalid rather than being silently ignored.
 
 On success, protocol applies the same effects as:
 
@@ -995,6 +996,7 @@ Implementations MUST cover at least the following cases.
 1. Accept a matching `(verifier, key_id)` and requested approval scope.
 2. Reject the same key ID under another verifier.
 3. Reject `ARBITRARY` as an inline-root credential.
+4. Reject an inline-root `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit.
 
 ### Verification context
 
