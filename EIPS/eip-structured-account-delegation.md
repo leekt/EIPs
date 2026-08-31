@@ -47,7 +47,7 @@ A new `CONFIGURE` frame mode and mode-specific `APPROVE_CONFIGURE` action suppor
 1. replacing the structured descriptor; and
 2. mutating authority state consumed by the current verification implementation.
 
-`CONFIGURE` may execute before transaction payment is approved. This permits an existing administrator to install a new actor and a later `VERIFY` frame in the same transaction to authorize execution or payment with that new actor.
+`CONFIGURE` may execute before transaction payment is approved. This permits an existing administrator to install a new credential authorization and a later `VERIFY` frame in the same transaction to authorize execution or payment with that new credential.
 
 This combines [EIP-8141](./eip-8141.md)'s frame transaction, payment, execution, and signature container with [EIP-8130](./eip-8130.md)'s `authenticator -> actor identity -> authorization` model. It does not define a second transaction envelope, a second signature namespace, or a mandatory keystore layout.
 
@@ -85,12 +85,12 @@ A blanket requirement that payment be approved before configuration prevents a u
 
 ```text
 old administrator signature
-  -> CONFIGURE installs new actor
-new actor signature
+  -> CONFIGURE installs new credential authorization
+new credential signature
   -> VERIFY approves execution and payment
 ```
 
-All protocol-validated signatures are authenticated before frame execution, so the new actor's cryptographic proof can be checked before the actor becomes authorized. Frame ordering then determines when the new authority state becomes visible. This proposal therefore permits pre-payment configuration while bounding it through the validation-prefix and public-mempool rules below.
+All protocol-validated signatures are authenticated before frame execution, so the new credential's cryptographic proof can be checked before the credential becomes authorized. Frame ordering then determines when the new authority state becomes visible. This proposal therefore permits pre-payment configuration while bounding it through the validation-prefix and public-mempool rules below.
 
 ## Specification
 
@@ -807,7 +807,7 @@ and authorization binds the exact `(verifier, key_id)` pair. `INLINE_ROOT` store
 
 Verification implementations are expected to be fewer and smaller than wallet execution implementations. A chain can recognize a canonical validation code hash while leaving execution code unrestricted.
 
-Allowlisting is public-mempool policy, not account authorization. The verification implementation still decides which authenticated actor may approve the transaction.
+Allowlisting is public-mempool policy, not account authorization. The verification implementation still decides which authenticated credential may approve the transaction.
 
 ### Why the protocol does not know an ABI
 
