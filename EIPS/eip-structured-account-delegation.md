@@ -560,12 +560,12 @@ When `new_descriptor_length > 0`, the indicated descriptor is installed or repla
 
 If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before halting. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
 
-If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. The referenced canonical-hash entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
+If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. The referenced canonical-hash entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol treats this validation as the configuration license and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
 
 If `tx.sender` is not yet structured, the installation path depends on the account's current code. `sender_approved` alone never authorizes installation for an account with code: [EIP-8141](./eip-8141.md) execution approval permits frames to call on the account's behalf; it is not consent to replace account code.
 
-- **Code-less account.** `configuration_data` MUST be empty and `sender_approved` MUST already be true. A code-less account can only have been approved through the [EIP-8141](./eip-8141.md) default-account path, so the approval is the account's canonical secp256k1 root signature. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the descriptor.
-- **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry with empty `msg` whose recovered address equals `tx.sender`. That key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the descriptor, replacing the delegation indicator.
+- **Code-less account.** `configuration_data` MUST be empty and `sender_approved` MUST already be true. A code-less account can only have been approved through the [EIP-8141](./eip-8141.md) default-account path, so the approval is the account's canonical secp256k1 root signature. The protocol treats this validation as the configuration license and installs the descriptor.
+- **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry with empty `msg` whose recovered address equals `tx.sender`. That key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The protocol treats this validation as the configuration license and installs the descriptor, replacing the delegation indicator.
 - **Account with any other code.** The account's own validation code MUST first approve `APPROVE_CONFIGURE` from its `VERIFY` frame; the `CONFIGURE` frame then executes the account's existing code in the non-static configuration context and succeeds on normal halt. An account whose validation code cannot approve `APPROVE_CONFIGURE` requires a wallet-specific upgrade before it can become structured.
 
 #### Applying configuration
@@ -718,7 +718,7 @@ The execution implementation is intentionally independent from the authority imp
 
 [EIP-7702](./eip-7702.md) authorization processing MUST NOT overwrite structured code.
 
-Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current root-equivalent authority: the current structured descriptor's authority path; the default-account root signature for a code-less account; the account's own secp256k1 key for an [EIP-7702](./eip-7702.md) delegation indicator; or the account's existing code invoking `APPROVE_CONFIGURE`. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
+Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current root-equivalent authority: the current structured descriptor's authority path; the default-account root signature for a code-less account; the account's own secp256k1 key for an [EIP-7702](./eip-7702.md) delegation indicator; or the account's own validation code approving the `APPROVE_CONFIGURE` scope. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
 
 [EIP-8298](./eip-8298.md) `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid [EIP-8298](./eip-8298.md) source. Otherwise ordinary execution code could replace the authority descriptor outside `CONFIGURE`.
 
@@ -919,7 +919,7 @@ This proposal requires a network upgrade because it assigns special semantics to
 
 [EIP-3541](./eip-3541.md) prevents newly deployed ordinary code beginning with `0xef`, so existing deployable EVM contracts are not reinterpreted as structured accounts.
 
-Pre-upgrade clients reject structured descriptors and do not understand the new signature attributes, `CONFIGURE` mode, or `APPROVE_CONFIGURE` action.
+Pre-upgrade clients reject structured descriptors and do not understand the new signature attributes, `CONFIGURE` mode, or `APPROVE_CONFIGURE` scope.
 
 ## Test Cases
 
