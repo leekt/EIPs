@@ -42,7 +42,7 @@ Two authority types are initially defined.
 
 `VERIFY_IMPLEMENTATION` loads code from `verification_implementation` while retaining the structured account as the EVM execution context. The selected code receives frame calldata unchanged, chooses where and how authority state is represented, and invokes [EIP-8141](./eip-8141.md) `APPROVE` from the account context. Ordinary calls execute the independent `execution_implementation`.
 
-A new `CONFIGURE` frame mode and mode-specific `APPROVE_CONFIGURE` action support both:
+A new `CONFIGURE` frame mode and an additional `APPROVE_CONFIGURE` approval scope support both:
 
 1. replacing the structured descriptor; and
 2. mutating authority state consumed by the current verification implementation.
@@ -79,7 +79,7 @@ Configuration also needs the same separation. Changing the descriptor and changi
 - changing the descriptor replaces the execution implementation, authority type, or verification implementation pointer;
 - changing verification-owned data adds or revokes credentials, rotates a stateful root, changes a threshold, updates expiry, or modifies another authority parameter without changing the descriptor.
 
-Both operations are authorized by the current authority path and use the same `CONFIGURE` frame and `APPROVE_CONFIGURE` action.
+Both operations are authorized by the current authority path, which approves the `APPROVE_CONFIGURE` scope from a `VERIFY` frame; the `CONFIGURE` frame performs the licensed mutation.
 
 A blanket requirement that payment be approved before configuration prevents a useful construction:
 
@@ -114,11 +114,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 | `CONFIGURE_MODE` | `0x03` |
 | `CONFIGURE_LENGTH_BYTES` | `2` |
 | `NO_DESCRIPTOR_CHANGE` | `0x0000` |
-| `APPROVE_CONFIGURE` | `0x10` |
+| `APPROVE_CONFIGURE` | `0x8` |
+| `EXTENDED_APPROVE_SCOPE_MASK` | `0xB` |
 | `STRUCTURED_VERIFY_BASE_GAS` | `500` |
 | `CONFIGURE_BASE_GAS` | `5000` |
 
-`APPROVE_CONFIGURE` is an `APPROVE` operand used only in `CONFIGURE` mode. It is not part of `APPROVE_SCOPE_MASK` and is not encoded in `frame.flags`.
+`APPROVE_CONFIGURE` is an additional `APPROVE` scope bit, approvable only from `VERIFY` frames targeting `tx.sender`. It is deliberately excluded from `APPROVE_SCOPE_MASK`, so every existing execution/payment rule is unchanged; the scope check uses `EXTENDED_APPROVE_SCOPE_MASK = APPROVE_SCOPE_MASK | APPROVE_CONFIGURE`.
 
 The gas values are provisional pending client benchmarks.
 
@@ -419,45 +420,48 @@ No verification or execution implementation bytecode runs.
 
 ### `APPROVE_CONFIGURE`
 
-This proposal extends the [EIP-8141](./eip-8141.md) `APPROVE` instruction with the mode-specific operand `APPROVE_CONFIGURE`.
+This proposal extends the [EIP-8141](./eip-8141.md) `APPROVE` instruction with the scope bit `APPROVE_CONFIGURE` (`0x8`), approvable only from `VERIFY` frames.
 
-Existing `APPROVE_PAYMENT`, `APPROVE_EXECUTION`, and `APPROVE_EXECUTION_AND_PAYMENT` behavior is unchanged in `VERIFY` mode. `APPROVE_CONFIGURE` is invalid in `VERIFY`, `DEFAULT`, and `SENDER` modes.
+Configuration authorization is thereby expressed where every other authorization already lives: the account's verification path, while it is authenticating credentials, decides whether this transaction may configure the account. The `CONFIGURE` frame itself never authorizes; it is a licensed mutation frame. Approval sets the transaction-scoped value `configure_approved`, initialized to false.
 
-[EIP-8141](./eip-8141.md)'s existing scope check (`scope != 0 and scope & ~(frame.flags & APPROVE_SCOPE_MASK) == 0`) would reject `APPROVE_CONFIGURE` unconditionally, because `0x10` is never part of `frame.flags`. The instruction's entry is therefore redefined as an explicit mode dispatch:
+`APPROVE` is redefined as:
 
 ```python
 def approve(scope, offset, length):
     if not is_frame_transaction():
         exceptional_halt()
     if frame.mode == CONFIGURE:
-        if scope != APPROVE_CONFIGURE:
+        revert()
+    if ADDRESS != resolved_target:
+        revert()
+    allowed = frame.flags & EXTENDED_APPROVE_SCOPE_MASK
+    if scope == 0 or scope & ~allowed != 0:
+        revert()
+    if scope & APPROVE_CONFIGURE:
+        if frame.mode != VERIFY:
             revert()
-        execute_approve_configure(offset, length)
-    else:
-        if scope == APPROVE_CONFIGURE:
+        if resolved_target != tx.sender:
             revert()
-        execute_existing_eip8141_approve(scope, offset, length)
+        if configure_approved:
+            revert()
+        configure_approved = True
+    remaining = scope & APPROVE_SCOPE_MASK
+    if remaining != 0:
+        apply_existing_eip8141_approval_effects(remaining)
+    terminate_frame_successfully(offset, length)
 ```
 
-In `CONFIGURE` mode the existing execution/payment scope check never runs. In every other mode existing [EIP-8141](./eip-8141.md) behavior is unchanged; the explicit `APPROVE_CONFIGURE` rejection is equivalent to the existing scope check, which `0x10` can never satisfy.
+A `VERIFY` frame may approve `APPROVE_CONFIGURE` alone or combined with execution/payment bits in a single `APPROVE`. Existing `APPROVE_PAYMENT`, `APPROVE_EXECUTION`, and `APPROVE_EXECUTION_AND_PAYMENT` behavior is unchanged. Any `APPROVE` inside a `CONFIGURE` frame reverts.
 
-When `APPROVE` is executed with `scope == APPROVE_CONFIGURE` in a `CONFIGURE` frame:
+Because the approving code runs while the transaction's frame list is introspectable, a verification implementation SHOULD read the `CONFIGURE` frame's exact data through frame introspection before approving, and MUST bind its approval to that payload under its own authorization model.
 
-1. If `ADDRESS != resolved_target`, revert the current call frame.
-2. If `resolved_target != tx.sender`, revert the current call frame.
-3. If `frame.flags & APPROVE_SCOPE_MASK != 0`, revert the current call frame.
-4. If the opcode is not executed in the top-level EVM call frame created for the `CONFIGURE` frame, revert the current call frame.
-5. If the current `CONFIGURE` frame has already been approved, revert the current call frame.
-6. Mark the current configuration as approved.
-7. Terminate the top-level configuration call frame successfully, using the `offset` and `length` operands as return data exactly as existing `APPROVE` does.
-
-`APPROVE_CONFIGURE` does not require `payer` to be set. It does not set `sender_approved`, does not select or change `payer`, does not increment a nonce, and does not collect maximum cost.
+Approving `APPROVE_CONFIGURE` does not require `payer` to be set. It does not set `sender_approved`, does not select or change `payer`, does not increment a nonce, and does not collect maximum cost.
 
 If `payer == None` when the `CONFIGURE` frame begins, the configuration is a **pre-payment configuration** and belongs to the transaction's validation prefix. Its effects remain part of the transaction journal and are visible to later frames. They commit only if a later frame successfully establishes a payer and the transaction remains valid.
 
 If no payer is established by transaction end, or a later `VERIFY` frame makes the transaction invalid, all pre-payment configuration effects are reverted with the transaction.
 
-`APPROVE_CONFIGURE` is permitted in a `CONFIGURE` frame belonging to an atomic batch only when `payer` was already set at frame entry. Existing execution/payment approvals remain unavailable inside an atomic batch.
+A `CONFIGURE` frame belonging to an atomic batch is permitted only when `payer` was already set at frame entry. Existing execution/payment approvals remain unavailable inside an atomic batch.
 
 ### `CONFIGURE` frame
 
@@ -473,16 +477,15 @@ The static frame constraint becomes:
 assert frame.mode < 4
 ```
 
-[EIP-8141](./eip-8141.md)'s flag-validity table is extended: `ATOMIC_BATCH_FLAG` (bit 2) becomes valid on `DEFAULT`, `SENDER`, and `CONFIGURE` frames. A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- additionally requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
+[EIP-8141](./eip-8141.md)'s flag-validity table is extended: `ATOMIC_BATCH_FLAG` (bit 2) becomes valid on `DEFAULT`, `SENDER`, and `CONFIGURE` frames. A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- additionally requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches. The `APPROVE_CONFIGURE` bit (bit 3) becomes a valid flag bit on `VERIFY` frames whose `resolved_target` is `tx.sender`, and on no other frame.
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
 
-`CONFIGURE` composes with `VERIFY` in either order:
+Every code-executing `CONFIGURE` frame MUST be preceded by a `VERIFY` frame that approved `APPROVE_CONFIGURE`, and `configure_approved` MUST be true at `CONFIGURE` frame entry. The direct protocol paths defined below (inline-root replacement, code-less installation, delegation-indicator installation) carry their own protocol-checked authorization and are exempt.
 
-- A `CONFIGURE` frame MUST be accepted before any `VERIFY` frame, including the sender's, provided it succeeds through `APPROVE_CONFIGURE` or a direct protocol path. Later validation frames observe its effects; this ordering is the install-and-first-use construction.
-- A `CONFIGURE` frame MAY follow `VERIFY` frames, executing as an ordinary paid frame once a payer is set.
+The licensing `VERIFY` frame MAY be the same frame that approves execution and payment -- one `APPROVE` with combined scope -- or a configure-only `VERIFY` frame, before or after payer approval. The same canonical-hash signature entry may support the licensing frame and any other frame: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the modes duplicates no witness and repeats no cryptographic verification. Later validation frames observe the configuration's effects, so a pre-payment licensing `VERIFY` plus `CONFIGURE` ahead of the remaining validation frames is the install-and-first-use construction.
 
-The same canonical-hash signature entry may authorize both frames: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the two modes duplicates no witness and repeats no cryptographic verification. In both orders a `CONFIGURE` frame never inherits authority from another frame: it succeeds only through `APPROVE_CONFIGURE` or a direct protocol path, regardless of `sender_approved` or `payer` state.
+A `CONFIGURE` frame never authorizes itself and never inherits authority from `sender_approved` or `payer` state; only `configure_approved` or a direct protocol path licenses it.
 
 Its data is:
 
@@ -504,10 +507,11 @@ The frame is structurally valid only when:
 6. at most one `CONFIGURE` frame appears in the transaction.
 7. no `SENDER` frame precedes it.
 8. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
+9. unless the frame resolves to a direct protocol path, an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
 
 At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame.
 
-A `CONFIGURE` frame succeeds only through `APPROVE_CONFIGURE` or one of the direct protocol paths defined below. Returning or stopping normally without approval is a configuration failure and rolls back to the frame-entry checkpoint.
+A code-executing `CONFIGURE` frame requires `configure_approved == true` at entry and succeeds when its selected code halts normally (`STOP` or `RETURN`). A revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint. Direct protocol paths succeed through their own validation rules.
 
 - If the frame began before payer approval, any configuration failure, revert, or exceptional halt makes the frame transaction invalid.
 - If the frame began after payer approval, configuration failure produces a failed paid frame and the transaction may continue under ordinary frame semantics.
@@ -536,7 +540,7 @@ This form is valid only when the current account is a structured `VERIFY_IMPLEME
 | `SELFBALANCE` | structured account balance |
 | nested self-call dispatch | current verification implementation |
 
-The implementation authenticates the current root, administrator, recovery path, multisig, or other authority according to its own rules; mutates its chosen authority state; and finally invokes `APPROVE(APPROVE_CONFIGURE)`.
+The frame is already licensed by the earlier `VERIFY` approval. The implementation performs its chosen authority-state mutation and halts normally when complete; it does not authenticate again unless its own policy requires it.
 
 The mutable state may be:
 
@@ -548,13 +552,13 @@ The mutable state may be:
 
 This form can add or revoke a credential authorization, rotate a stateful root, change expiry, update a threshold, or modify recovery configuration without changing the descriptor.
 
-All writes and external calls occur before `APPROVE_CONFIGURE`. Because `APPROVE_CONFIGURE` terminates the top-level configuration call frame, no configuration write can occur after approval. If approval is never reached, all provisional effects are rolled back.
+If the frame reverts or halts exceptionally, all provisional effects are rolled back to the frame-entry checkpoint.
 
 #### Configuration class 2: descriptor update
 
 When `new_descriptor_length > 0`, the indicated descriptor is installed or replaces the current descriptor after authorization.
 
-If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before calling `APPROVE_CONFIGURE`. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
+If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before halting. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
 
 If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. The referenced canonical-hash entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
 
@@ -562,7 +566,7 @@ If `tx.sender` is not yet structured, the installation path depends on the accou
 
 - **Code-less account.** `configuration_data` MUST be empty and `sender_approved` MUST already be true. A code-less account can only have been approved through the [EIP-8141](./eip-8141.md) default-account path, so the approval is the account's canonical secp256k1 root signature. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the descriptor.
 - **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry with empty `msg` whose recovered address equals `tx.sender`. That key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the descriptor, replacing the delegation indicator.
-- **Account with any other code.** The account's existing code executes in the non-static configuration context and MUST invoke `APPROVE(APPROVE_CONFIGURE)`. An account whose code does not implement `APPROVE_CONFIGURE` requires a wallet-specific upgrade before it can become structured.
+- **Account with any other code.** The account's own validation code MUST first approve `APPROVE_CONFIGURE` from its `VERIFY` frame; the `CONFIGURE` frame then executes the account's existing code in the non-static configuration context and succeeds on normal halt. An account whose validation code cannot approve `APPROVE_CONFIGURE` requires a wallet-specific upgrade before it can become structured.
 
 #### Applying configuration
 
@@ -614,11 +618,12 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
             assert sig.key_id == bytes32(tx.sender)
             configuration_approved = True
         else:
+            assert configure_approved
+            # success = normal halt (STOP or RETURN)
             configuration_approved = execute_current_account_code(
                 mode=CONFIGURE_MODE,
                 static=False,
                 calldata=frame.data,
-                success_condition=APPROVE_CONFIGURE,
             )
 
     elif current_descriptor.authority_type == INLINE_ROOT:
@@ -636,11 +641,12 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
         configuration_approved = True
 
     elif current_descriptor.authority_type == VERIFY_IMPLEMENTATION:
+        assert configure_approved
+        # success = normal halt (STOP or RETURN)
         configuration_approved = execute_current_verification_implementation(
             mode=CONFIGURE_MODE,
             static=False,
             calldata=frame.data,
-            success_condition=APPROVE_CONFIGURE,
         )
 
     if not configuration_approved:
@@ -672,23 +678,27 @@ A pre-payment `CONFIGURE` frame may install a new authorization entry that autho
 signatures[0] = current administrator signs canonical transaction hash
 signatures[1] = new credential holder signs canonical transaction hash
 
-frame 0: CONFIGURE
+frame 0: VERIFY
     current verification implementation authenticates signatures[0]
-    installs authorization for signatures[1].(verifier, key_id)
-    APPROVE_CONFIGURE
+    inspects the CONFIGURE frame payload via frame introspection
+    APPROVE(APPROVE_CONFIGURE)
 
-frame 1: VERIFY
+frame 1: CONFIGURE
+    current verification implementation installs authorization
+    for signatures[1].(verifier, key_id) and halts normally
+
+frame 2: VERIFY
     current verification implementation reads signatures[1]
-    observes the authorization installed by frame 0
+    observes the authorization installed by frame 1
     APPROVE_EXECUTION_AND_PAYMENT
 
-frame 2: SENDER
+frame 3: SENDER
     ordinary execution
 ```
 
 [EIP-8141](./eip-8141.md) authenticates both protocol-validated signatures before frame execution. This does not authorize the new credential early; it only establishes the credential identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
 
-If frame 0 fails, frame 1 fails, no payer is established, or another validation failure makes the transaction invalid, the authorization installation is reverted.
+If any of frames 0 through 2 fails, no payer is established, or another validation failure makes the transaction invalid, the authorization installation is reverted.
 
 ### Ordinary execution
 
@@ -734,7 +744,7 @@ Verification-implementation authorization uses the frame's ordinary [EIP-8141](.
 
 When configuration precedes payer approval, its consumed gas and state gas are still included in the transaction's total usage and maximum cost. The later payer approval therefore escrows and ultimately pays for work already performed earlier in the frame sequence. If no payer is established, the transaction is invalid and cannot be included.
 
-`APPROVE_CONFIGURE` has the same memory-expansion and return-data cost behavior as existing `APPROVE`. It has no additional execution-gas base cost.
+Approving the `APPROVE_CONFIGURE` scope is an ordinary `APPROVE` with no additional execution-gas base cost.
 
 A direct evaluator MUST reproduce equivalent EVM gas, warmness, returndata, state effects, failure behavior, and approval effects. Direct evaluation is an optimization, not a repricing.
 
@@ -751,7 +761,7 @@ Public-mempool implementations MUST recognize the forms:
 [pre_configure, only_verify, pay]
 ```
 
-when `pre_configure` is directly evaluable: an inline-root descriptor replacement, a code-less-account installation, or an [EIP-7702](./eip-7702.md)-indicator installation, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation or existing account code remains profile-dependent (see below).
+when `pre_configure` is directly evaluable: an inline-root descriptor replacement, a code-less-account installation, or an [EIP-7702](./eip-7702.md)-indicator installation, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation or existing account code remains profile-dependent (see below); such forms include the licensing configure-approving `VERIFY` frame, for example `[configure_verify, pre_configure, self_verify]`.
 
 A pre-payment configuration is evaluated on a temporary state overlay. Every later validation frame observes that overlay. The overlay is discarded if the transaction is rejected, replaced, evicted, becomes invalid, or fails to establish a payer.
 
@@ -830,11 +840,11 @@ Core protocol forwards `frame.data` unchanged. ABI knowledge belongs to the sele
 
 A simple account should not pay an external call and storage lookup merely to represent one ultimate key. `INLINE_ROOT` is the one-entry specialization of the same `(verifier, key_id) -> authority` model used by richer implementations.
 
-### Why configuration uses `APPROVE`
+### Why configuration authorization lives in `VERIFY`
 
-A separate magic return value would create another signaling convention alongside [EIP-8141](./eip-8141.md) `APPROVE`. `APPROVE_CONFIGURE` keeps every account-context authorization result on one protocol channel.
+Authorization grammar in [EIP-8141](./eip-8141.md) is the `APPROVE` scope approved from validation frames. Expressing configuration authority as an additional scope bit keeps one authorization channel, lets a single verification pass approve execution, payment, and configuration together over one credential, and keeps every authorization decision inside statically analyzable `VERIFY` frames or direct protocol paths. The `CONFIGURE` frame is thereby a licensed, non-static mutation frame with no authority of its own -- which also lets it compose with atomic batches and multi-operation configuration payloads.
 
-The action is mode-specific rather than an execution/payment frame flag. This prevents a session credential's ability to approve execution from automatically implying descriptor or authority-state administration.
+The scope bit is excluded from `APPROVE_SCOPE_MASK`, so a wallet that approves execution for a restricted credential never implicitly grants configuration; the verification implementation decides per credential which scopes to approve.
 
 ### Why configuration may precede payment
 
@@ -949,13 +959,13 @@ Implementations MUST cover at least the following cases.
 
 ### `APPROVE_CONFIGURE`
 
-1. Accept `APPROVE_CONFIGURE` before or after payer approval when `ADDRESS == resolved_target == tx.sender`.
-2. Reject it in `VERIFY`, `DEFAULT`, and `SENDER` modes.
-3. Reject execution/payment approval operands in `CONFIGURE` mode.
-4. Confirm it does not alter `sender_approved`, payer, nonce, or maximum-cost collection.
-5. Confirm it terminates the top-level configuration call frame successfully.
-6. Reject it from a nested `CALL`, `DELEGATECALL`, or `CALLCODE` frame.
-7. Confirm a normal return without approval rolls back all configuration state changes.
+1. Approve `APPROVE_CONFIGURE` from a `VERIFY` frame targeting `tx.sender`, alone and combined with execution/payment scope in one `APPROVE`, before and after payer approval.
+2. Reject the `APPROVE_CONFIGURE` scope bit in `DEFAULT` and `SENDER` modes and when `resolved_target != tx.sender`.
+3. Reject any `APPROVE` inside a `CONFIGURE` frame.
+4. Reject a second `APPROVE_CONFIGURE` when `configure_approved` is already set.
+5. Confirm approving `APPROVE_CONFIGURE` does not alter `sender_approved`, payer, nonce, or maximum-cost collection.
+6. Reject a code-executing `CONFIGURE` frame with no preceding configure-approving `VERIFY` frame.
+7. Confirm a licensed `CONFIGURE` frame succeeds on normal halt, and rolls back all configuration state changes on revert or exceptional halt.
 8. Reject a pre-payment configuration that carries `ATOMIC_BATCH_FLAG` or terminates an atomic batch begun by its predecessor.
 
 ### Pre-payment configuration
@@ -979,7 +989,7 @@ Implementations MUST cover at least the following cases.
 
 1. Install a descriptor on a code-less account after default-account approval.
 2. Install over an [EIP-7702](./eip-7702.md) delegation indicator with the account's own canonical secp256k1 signature; reject any other signer, scheme, or non-empty `msg`.
-3. Reject direct installation on an account with contract code; require `APPROVE_CONFIGURE` from that code.
+3. Reject direct installation on an account with contract code; require a configure approval from that account's own `VERIFY` frame.
 4. Reject installation on a smart account whose transaction was execution-approved by a restricted credential and whose code does not approve configuration.
 
 ### Descriptor configuration
@@ -1034,7 +1044,7 @@ The descriptor names an address rather than a code hash. Code changes at that ad
 
 ### Transitive code execution
 
-Code reached through `DELEGATECALL` or `CALLCODE` runs with the structured account address and can mutate configuration state or influence authorization. It cannot directly complete configuration because `APPROVE_CONFIGURE` is restricted to the top-level configuration call frame, but it remains part of the authority implementation's trust boundary.
+Code reached through `DELEGATECALL` or `CALLCODE` runs with the structured account address and can mutate configuration state or influence authorization. Because it shares the account context, it can also invoke `APPROVE` within [EIP-8141](./eip-8141.md)'s existing rules; it is fully part of the authority implementation's trust boundary.
 
 ### External authority contracts
 
@@ -1042,7 +1052,7 @@ An external keystore or authority service cannot approve directly, but a malicio
 
 ### Configuration authorization binding
 
-A verification implementation must invoke `APPROVE_CONFIGURE` only after authorization is bound to every security-critical field. For descriptor updates this includes the exact new descriptor. For authority-state updates it includes the exact mutation payload. Account, chain or replay domain, and update nonce or sequence must be included where required by the authority model.
+A verification implementation must approve `APPROVE_CONFIGURE` only after authorization is bound to every security-critical field. For descriptor updates this includes the exact new descriptor. For authority-state updates it includes the exact mutation payload. Account, chain or replay domain, and update nonce or sequence must be included where required by the authority model.
 
 A signature index alone MUST NOT be assumed to commit the configuring authority to signature-derived metadata. For the initial `SECP256K1` and `P256` schemes the entry's committed `signer` metadata fixes the credential, but a future scheme whose credential identifier travels in elided witness bytes could change `(verifier, key_id)` without changing the canonical transaction hash. A verification implementation that installs authorization derived from a referenced signature MUST bind the expected `verifier` and `key_id` into data its authorization covers.
 
@@ -1056,9 +1066,9 @@ Installing a stateful verification implementation without initialized authority 
 
 ### Execution approval is not configuration authority
 
-[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority for an account with code would let such a credential replace the account's code and seize root authority. Installation paths therefore accept `sender_approved` only for code-less accounts, where it is necessarily the account's root signature.
+[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority for an account with code would let such a credential replace the account's code and seize root authority. Installation paths therefore accept `sender_approved` only for code-less accounts, where it is necessarily the account's root signature. Configuration authority is tracked as the separate `configure_approved` value, which only a `VERIFY`-frame `APPROVE` in the account's own context (or a direct protocol path) can establish.
 
-The same rule applies inside verification implementations. Code running in `CONFIGURE` mode after an earlier `VERIFY` frame MUST derive configuration authority from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority.
+The same rule applies inside verification implementations. Code deciding whether to approve `APPROVE_CONFIGURE` MUST derive that decision from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority. It MUST bind the approval to the exact `CONFIGURE` frame payload, which it can read through frame introspection before approving.
 
 ### Descriptor installation discards prior code
 
