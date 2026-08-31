@@ -471,13 +471,23 @@ A `CONFIGURE` frame belonging to an atomic batch is permitted only when `payer` 
 |---|---|---|
 | `0x03` | `CONFIGURE` | mutate verification-owned authority state and optionally install or replace a structured descriptor |
 
-The static frame constraint becomes:
+[EIP-8141](./eip-8141.md)'s static frame constraints `frame.mode < 3` and `frame.flags < 8` become:
 
 ```python
 assert frame.mode < 4
+assert frame.flags < 16
 ```
 
-[EIP-8141](./eip-8141.md)'s flag-validity table is extended: `ATOMIC_BATCH_FLAG` (bit 2) becomes valid on `DEFAULT`, `SENDER`, and `CONFIGURE` frames. A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- additionally requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches. The `APPROVE_CONFIGURE` bit (bit 3) becomes a valid flag bit on `VERIFY` frames whose `resolved_target` is `tx.sender`, and on no other frame.
+[EIP-8141](./eip-8141.md)'s flag-validity rules are extended:
+
+| Bit | Meaning | Valid on |
+|---|---|---|
+| `0-1` | execution/payment approval scope | existing [EIP-8141](./eip-8141.md) rules |
+| `2` | `ATOMIC_BATCH_FLAG` | `DEFAULT`, `SENDER`, and post-payment `CONFIGURE` frames |
+| `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` |
+| `4+` | reserved | no frame |
+
+A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
 
