@@ -40,7 +40,7 @@ Two authority types are initially defined.
 
 `INLINE_ROOT` directly binds one protocol-authenticated `(verifier, key_id)` pair to the account.
 
-`VERIFY_IMPLEMENTATION` loads code from `verification_implementation` while retaining the structured account as the EVM execution context. The selected code receives frame calldata unchanged, chooses where and how authority state is represented, and invokes EIP-8141 `APPROVE` from the account context. Ordinary calls execute the independent `execution_implementation`.
+`VERIFY_IMPLEMENTATION` loads code from `verification_implementation` while retaining the structured account as the EVM execution context. The selected code receives frame calldata unchanged, chooses where and how authority state is represented, and invokes [EIP-8141](./eip-8141.md) `APPROVE` from the account context. Ordinary calls execute the independent `execution_implementation`.
 
 A new `CONFIGURE` frame mode and mode-specific `APPROVE_CONFIGURE` action support both:
 
@@ -49,13 +49,13 @@ A new `CONFIGURE` frame mode and mode-specific `APPROVE_CONFIGURE` action suppor
 
 `CONFIGURE` may execute before transaction payment is approved. This permits an existing administrator to install a new actor and a later `VERIFY` frame in the same transaction to authorize execution or payment with that new actor.
 
-This combines EIP-8141's frame transaction, payment, execution, and signature container with EIP-8130's `authenticator -> actor identity -> authorization` model. It does not define a second transaction envelope, a second signature namespace, or a mandatory keystore layout.
+This combines [EIP-8141](./eip-8141.md)'s frame transaction, payment, execution, and signature container with [EIP-8130](./eip-8130.md)'s `authenticator -> actor identity -> authorization` model. It does not define a second transaction envelope, a second signature namespace, or a mandatory keystore layout.
 
 ## Motivation
 
-EIP-8141 permits arbitrary account code to validate frame transactions. This preserves programmability, but couples authorization to the complete wallet implementation. A sequencer seeking a statically understandable path must either recognize every wallet implementation or execute and trace arbitrary wallet code.
+[EIP-8141](./eip-8141.md) permits arbitrary account code to validate frame transactions. This preserves programmability, but couples authorization to the complete wallet implementation. A sequencer seeking a statically understandable path must either recognize every wallet implementation or execute and trace arbitrary wallet code.
 
-EIP-8130 separates three responsibilities:
+[EIP-8130](./eip-8130.md) separates three responsibilities:
 
 ```text
 authenticator  -> proves a credential and returns an actor identity
@@ -65,7 +65,7 @@ account code   -> performs ordinary execution
 
 The useful parts of both designs can be combined into one native account model:
 
-1. EIP-8141 remains the single transaction, frame, payment, and signature format.
+1. [EIP-8141](./eip-8141.md) remains the single transaction, frame, payment, and signature format.
 2. Protocol or pure authentication produces a normalized `(verifier, key_id)` result.
 3. A structured account selects a narrow authorization path independently from ordinary wallet execution.
 4. The authorization path invokes `APPROVE`, after which ordinary frame execution continues.
@@ -133,20 +133,20 @@ AuthenticationResult {
 }
 ```
 
-`verifier` identifies the native or pure authentication program. `key_id` identifies the exact credential or canonical credential configuration proven by the witness.
+`verifier` identifies the native or pure authentication program. `ECRECOVER_VERIFIER` is the `ecrecover` precompile address; `P256_VERIFIER` is the [EIP-7951](./eip-7951.md) `secp256r1` verification precompile address. `key_id` identifies the exact credential or canonical credential configuration proven by the witness.
 
 The initial normalization rules are:
 
 | Signature scheme | `verifier` | `key_id` |
 |---|---|---|
-| EIP-8141 `SECP256K1` | `ECRECOVER_VERIFIER` | recovered address right-aligned in 32 bytes |
-| EIP-8141 `P256` | `P256_VERIFIER` | `keccak256(qx || qy)` |
+| [EIP-8141](./eip-8141.md) `SECP256K1` | `ECRECOVER_VERIFIER` | recovered address right-aligned in 32 bytes |
+| [EIP-8141](./eip-8141.md) `P256` | `P256_VERIFIER` | `keccak256(qx || qy)` |
 
 A future EIP defining an additional protocol-validated signature scheme MAY extend this table by specifying how the scheme derives its `AuthenticationResult` from the verified witness.
 
 For P-256, the full public key remains part of the opaque protocol-validated signature entry. Computing its identifier does not expose the raw witness to EVM code.
 
-An `ARBITRARY` signature entry does not produce an authenticated result. It may still be consumed through EIP-8141 `SIGDATACOPY`, but it cannot directly authorize `INLINE_ROOT`.
+An `ARBITRARY` signature entry does not produce an authenticated result. It may still be consumed through [EIP-8141](./eip-8141.md) `SIGDATACOPY`, but it cannot directly authorize `INLINE_ROOT`.
 
 A future scheme proving a threshold, multisig, or other compound stateless credential SHOULD use:
 
@@ -158,9 +158,9 @@ provided the scheme derives the value from the verified witness rather than trus
 
 ### Signature entry attributes
 
-EIP-8141 validated signature entries are extended with immutable `verifier` and `key_id` attributes.
+[EIP-8141](./eip-8141.md) validated signature entries are extended with immutable `verifier` and `key_id` attributes.
 
-The EIP-8141 `SIGPARAM` table is extended with:
+The [EIP-8141](./eip-8141.md) `SIGPARAM` table is extended with:
 
 | `param` | Return value |
 |---|---|
@@ -169,7 +169,7 @@ The EIP-8141 `SIGPARAM` table is extended with:
 
 These values are defined only for signatures that produce an `AuthenticationResult`. Requesting either value for `ARBITRARY` results in an exceptional halt.
 
-Existing EIP-8141 `resolved_signer` behavior is unchanged for backward compatibility.
+Existing [EIP-8141](./eip-8141.md) `resolved_signer` behavior is unchanged for backward compatibility.
 
 ### Structured account envelope
 
@@ -295,7 +295,7 @@ The base protocol assigns no ABI, calldata format, storage layout, actor mapping
 
 ### Mode-sensitive code selection
 
-Structured account code is recognized before EIP-7702 delegation handling.
+Structured account code is recognized before [EIP-7702](./eip-7702.md) delegation handling.
 
 Frame dispatch is extended as follows:
 
@@ -324,9 +324,9 @@ else:
     execute_existing_eip8141_dispatch(frame)
 ```
 
-This is protocol code selection analogous to EIP-7702 delegated-code dispatch. It is not execution of the `DELEGATECALL` opcode and does not create an additional EVM call frame.
+This is protocol code selection analogous to [EIP-7702](./eip-7702.md) delegated-code dispatch. It is not execution of the `DELEGATECALL` opcode and does not create an additional EVM call frame.
 
-The code bytes are loaded directly from the selected implementation address without recursively resolving an EIP-7702 indicator or another structured descriptor at that address.
+The code bytes are loaded directly from the selected implementation address without recursively resolving an [EIP-7702](./eip-7702.md) indicator or another structured descriptor at that address.
 
 While the current frame mode is `VERIFY` or `CONFIGURE`, a nested code-executing operation targeting that frame's `resolved_target` MUST select the same verification implementation rather than the execution implementation. This prevents a self-call from switching the authority path into arbitrary wallet execution code.
 
@@ -342,17 +342,17 @@ A `VERIFY` frame targeting a `VERIFY_IMPLEMENTATION` account executes with:
 | `ADDRESS` | structured account (`resolved_target`) |
 | persistent storage | structured account storage |
 | transient storage | structured account transient storage |
-| top-level `CALLER` | EIP-8141 `ENTRY_POINT` |
-| `ORIGIN` | EIP-8141 frame caller |
+| top-level `CALLER` | [EIP-8141](./eip-8141.md) `ENTRY_POINT` |
+| `ORIGIN` | [EIP-8141](./eip-8141.md) frame caller |
 | `CALLVALUE` | `0` |
 | calldata | `frame.data`, unchanged |
 | static mode | enabled |
-| gas pools | frame-declared EIP-8141 limits |
+| gas pools | frame-declared [EIP-8141](./eip-8141.md) limits |
 | `CODESIZE`, `CODECOPY` | verification implementation code |
 | `EXTCODE*` of `ADDRESS` | structured descriptor code |
 | `SELFBALANCE` | structured account balance |
 
-Because `ADDRESS == resolved_target`, verification code may invoke EIP-8141 `APPROVE`.
+Because `ADDRESS == resolved_target`, verification code may invoke [EIP-8141](./eip-8141.md) `APPROVE`.
 
 An external contract reached with `CALL` or `STATICCALL` has its own address and cannot approve on behalf of the structured account. It must return a result to the account-context verification code, which performs the final authorization check and invokes `APPROVE`.
 
@@ -369,9 +369,9 @@ A verification implementation MAY:
 - call external authority contracts; and
 - invoke `APPROVE` after authorization succeeds.
 
-The frame remains subject to EIP-8141 `VERIFY` semantics. Revert, exceptional halt, or failure to invoke the required approval makes the frame transaction invalid. The approved execution/payment scope MUST be permitted by `frame.flags`.
+The frame remains subject to [EIP-8141](./eip-8141.md) `VERIFY` semantics. Revert, exceptional halt, or failure to invoke the required approval makes the frame transaction invalid. The approved execution/payment scope MUST be permitted by `frame.flags`.
 
-A minimal EIP-8130-style adapter can perform:
+A minimal [EIP-8130](./eip-8130.md)-style adapter can perform:
 
 ```text
 signature_index = parse(frame.data)
@@ -406,8 +406,8 @@ It succeeds only when:
 3. The referenced signature uses the canonical frame-transaction signing hash.
 4. The signature produces an `AuthenticationResult`.
 5. The result matches the descriptor's `(verifier, key_id)`.
-6. The frame requests a nonzero EIP-8141 approval scope.
-7. Every ordinary EIP-8141 structural rule for that scope holds.
+6. The frame requests a nonzero [EIP-8141](./eip-8141.md) approval scope.
+7. Every ordinary [EIP-8141](./eip-8141.md) structural rule for that scope holds.
 
 On success, protocol applies the same effects as:
 
@@ -419,7 +419,7 @@ No verification or execution implementation bytecode runs.
 
 ### `APPROVE_CONFIGURE`
 
-This proposal extends the EIP-8141 `APPROVE` instruction with the mode-specific operand `APPROVE_CONFIGURE`.
+This proposal extends the [EIP-8141](./eip-8141.md) `APPROVE` instruction with the mode-specific operand `APPROVE_CONFIGURE`.
 
 Existing `APPROVE_PAYMENT`, `APPROVE_EXECUTION`, and `APPROVE_EXECUTION_AND_PAYMENT` behavior is unchanged in `VERIFY` mode. `APPROVE_CONFIGURE` is invalid in `VERIFY`, `DEFAULT`, and `SENDER` modes.
 
@@ -443,7 +443,7 @@ If no payer is established by transaction end, or a later `VERIFY` frame makes t
 
 ### `CONFIGURE` frame
 
-EIP-8141's frame mode table is extended with:
+[EIP-8141](./eip-8141.md)'s frame mode table is extended with:
 
 | `mode` | Name | Summary |
 |---|---|---|
@@ -498,7 +498,7 @@ This form is valid only when the current account is a structured `VERIFY_IMPLEME
 | calldata | complete `frame.data`, unchanged |
 | static mode | disabled |
 | frame mode | `CONFIGURE_MODE` |
-| gas pools | frame-declared EIP-8141 limits |
+| gas pools | frame-declared [EIP-8141](./eip-8141.md) limits |
 
 The implementation authenticates the current root, administrator, recovery path, multisig, or other authority according to its own rules; mutates its chosen authority state; and finally invokes `APPROVE(APPROVE_CONFIGURE)`.
 
@@ -526,9 +526,9 @@ If `tx.sender` is not yet structured:
 
 - `sender_approved` MUST already be true;
 - `configuration_data` MUST be empty; and
-- the prior EIP-8141 validation path authorizes installation.
+- the prior [EIP-8141](./eip-8141.md) validation path authorizes installation.
 
-The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the descriptor. An account that cannot yet approve an EIP-8141 frame transaction requires an account-specific migration path outside this proposal.
+The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the descriptor. An account that cannot yet approve an [EIP-8141](./eip-8141.md) frame transaction requires an account-specific migration path outside this proposal.
 
 #### Applying configuration
 
@@ -600,7 +600,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
 
 If descriptor-write charging fails, the complete frame rolls back to its entry checkpoint. When this occurs before payer approval, the transaction is invalid; when it occurs after payer approval, the paid configuration frame fails.
 
-The complete configuration frame is committed by the canonical transaction signature whenever the selected authority uses an EIP-8141 signature with empty `msg`. A verification implementation using another authorization message MUST bind approval to all configuration data it considers security-critical, including the exact descriptor when present, account, chain or replay domain, and update nonce or sequence.
+The complete configuration frame is committed by the canonical transaction signature whenever the selected authority uses an [EIP-8141](./eip-8141.md) signature with empty `msg`. A verification implementation using another authorization message MUST bind approval to all configuration data it considers security-critical, including the exact descriptor when present, account, chain or replay domain, and update nonce or sequence.
 
 A descriptor update and authority-state update MAY occur in the same `VERIFY_IMPLEMENTATION` configuration frame.
 
@@ -628,7 +628,7 @@ frame 2: SENDER
     ordinary execution
 ```
 
-EIP-8141 authenticates both protocol-validated signatures before frame execution. This does not authorize the new actor early; it only establishes the actor identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
+[EIP-8141](./eip-8141.md) authenticates both protocol-validated signatures before frame execution. This does not authorize the new actor early; it only establishes the actor identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
 
 If frame 0 fails, frame 1 fails, no payer is established, or another validation failure makes the transaction invalid, the actor installation is reverted.
 
@@ -646,17 +646,17 @@ The execution implementation is intentionally independent from the authority imp
 
 ### Code installation and replacement
 
-EIP-3541 is modified to permit creation-time installation of code beginning with `0xef02` only when the complete code is a valid structured descriptor under an active authority type.
+[EIP-3541](./eip-3541.md) is modified to permit creation-time installation of code beginning with `0xef02` only when the complete code is a valid structured descriptor under an active authority type. A structured descriptor is account code for every other purpose, including the [EIP-170](./eip-170.md) size limit, which it trivially satisfies.
 
-EIP-7702 authorization processing MUST NOT overwrite structured code.
+[EIP-7702](./eip-7702.md) authorization processing MUST NOT overwrite structured code.
 
-Descriptor installation through `CONFIGURE` MAY replace empty code, an EIP-7702 delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current authority: the current structured descriptor's authority path, or, for a not-yet-structured account, the EIP-8141 validation path that set `sender_approved`. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
+Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current authority: the current structured descriptor's authority path, or, for a not-yet-structured account, the [EIP-8141](./eip-8141.md) validation path that set `sender_approved`. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
 
-EIP-8298 `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid EIP-8298 source. Otherwise ordinary execution code could replace the authority descriptor outside `CONFIGURE`.
+[EIP-8298](./eip-8298.md) `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid [EIP-8298](./eip-8298.md) source. Otherwise ordinary execution code could replace the authority descriptor outside `CONFIGURE`.
 
 Any future account-code replacement mechanism MUST explicitly specify whether it may replace structured code. The default is that it may not.
 
-Structured accounts have nonempty non-delegation code. Legacy ECDSA transaction origination remains invalid under EIP-3607, while EIP-8141 frame origination is permitted.
+Structured accounts have nonempty non-delegation code. Legacy ECDSA transaction origination remains invalid under [EIP-3607](./eip-3607.md), while [EIP-8141](./eip-8141.md) frame origination is permitted.
 
 ### Gas accounting
 
@@ -668,11 +668,11 @@ STRUCTURED_VERIFY_BASE_GAS
 + referenced signature validation cost
 ```
 
-Verification-implementation authorization uses the frame's ordinary EIP-8141 execution-gas budget. Resolving `verification_implementation` charges the applicable warm or cold account/code access cost analogously to EIP-7702 code resolution. Calls and storage reads made by verification code are charged through normal EVM rules.
+Verification-implementation authorization uses the frame's ordinary [EIP-8141](./eip-8141.md) execution-gas budget. Resolving `verification_implementation` charges the applicable [EIP-2929](./eip-2929.md) warm or cold account/code access cost analogously to [EIP-7702](./eip-7702.md) code resolution. Calls and storage reads made by verification code are charged through normal EVM rules.
 
 `CONFIGURE` runs non-statically for `VERIFY_IMPLEMENTATION` and may consume both execution and state gas. All calls, storage writes, account creation, logs, and external effects are charged normally. `CONFIGURE_BASE_GAS` additionally covers configuration dispatch and optional descriptor replacement bookkeeping. It is charged from the frame's `limits.execution` at frame entry, after the resolved-target account-access charge and before any verification-implementation code executes. A frame that cannot cover it fails exceptionally; before payer approval this makes the transaction invalid.
 
-`charge_descriptor_write` charges descriptor installation or replacement as state growth: `max(0, len(new_descriptor) - len(current_code)) * CPSB` is deducted from the frame's `state_gas_left` immediately before the code write, using the same per-state-byte accounting as EIP-8141's account-creation charge. A shrinking or equal-size replacement charges no growth. The dispatch cost of the write is covered by `CONFIGURE_BASE_GAS`; there is no separate per-byte execution-gas charge.
+`charge_descriptor_write` charges descriptor installation or replacement as state growth: `max(0, len(new_descriptor) - len(current_code)) * CPSB` is deducted from the frame's `state_gas_left` immediately before the code write, using the same per-state-byte accounting as [EIP-8141](./eip-8141.md)'s account-creation charge. A shrinking or equal-size replacement charges no growth. The dispatch cost of the write is covered by `CONFIGURE_BASE_GAS`; there is no separate per-byte execution-gas charge.
 
 When configuration precedes payer approval, its consumed gas and state gas are still included in the transaction's total usage and maximum cost. The later payer approval therefore escrows and ultimately pays for work already performed earlier in the frame sequence. If no payer is established, the transaction is invalid and cannot be included.
 
@@ -684,7 +684,7 @@ A direct evaluator MUST reproduce equivalent EVM gas, warmness, returndata, stat
 
 #### Validation-prefix inclusion
 
-A `CONFIGURE` frame occurring while `payer == None` is part of the EIP-8141 validation prefix. Its execution and state-gas limits count toward the active `MAX_VERIFY_GAS` and `MAX_VERIFY_STATE_GAS` bounds.
+A `CONFIGURE` frame occurring while `payer == None` is part of the [EIP-8141](./eip-8141.md) validation prefix. Its execution and state-gas limits count toward the active `MAX_VERIFY_GAS` and `MAX_VERIFY_STATE_GAS` bounds.
 
 Public-mempool implementations MAY recognize forms equivalent to:
 
@@ -718,7 +718,7 @@ A public-mempool profile admitting pre-payment configuration MUST define:
 9. the behavior of subsequent `VERIFY` frames against the temporary overlay; and
 10. an optional gas- and behavior-equivalent direct evaluator.
 
-A canonical EIP-8130-style actor-authority profile can use this mechanism to install an actor and immediately validate it without a separate transaction or account-change envelope.
+A canonical [EIP-8130](./eip-8130.md)-style actor-authority profile can use this mechanism to install an actor and immediately validate it without a separate transaction or account-change envelope.
 
 #### Post-payment configuration
 
@@ -736,7 +736,7 @@ The current runtime code hash at `verification_implementation` is always a valid
 
 ### Why verification executes in account context
 
-EIP-8141 `APPROVE` requires `ADDRESS == resolved_target`. Calling an external verifier or keystore directly cannot approve for the account. Selecting verification code while retaining the account context lets the narrow validation path invoke `APPROVE` without re-entering the ordinary wallet implementation.
+[EIP-8141](./eip-8141.md) `APPROVE` requires `ADDRESS == resolved_target`. Calling an external verifier or keystore directly cannot approve for the account. Selecting verification code while retaining the account context lets the narrow validation path invoke `APPROVE` without re-entering the ordinary wallet implementation.
 
 ### Why this is not ordinary `DELEGATECALL`
 
@@ -774,15 +774,15 @@ A simple account should not pay an external call and storage lookup merely to re
 
 ### Why configuration uses `APPROVE`
 
-A separate magic return value would create another signaling convention alongside EIP-8141 `APPROVE`. `APPROVE_CONFIGURE` keeps every account-context authorization result on one protocol channel.
+A separate magic return value would create another signaling convention alongside [EIP-8141](./eip-8141.md) `APPROVE`. `APPROVE_CONFIGURE` keeps every account-context authorization result on one protocol channel.
 
 The action is mode-specific rather than an execution/payment frame flag. This prevents a session actor's ability to approve execution from automatically implying descriptor or authority-state administration.
 
 ### Why configuration may precede payment
 
-An earlier draft required `payer != None` before `CONFIGURE`. That restriction was chosen to ensure configuration work was paid, keep non-static writes outside the public-mempool validation prefix, and avoid changing EIP-8141's validation-prefix rules.
+An earlier draft required `payer != None` before `CONFIGURE`. That restriction was chosen to ensure configuration work was paid, keep non-static writes outside the public-mempool validation prefix, and avoid changing [EIP-8141](./eip-8141.md)'s validation-prefix rules.
 
-It was unnecessarily restrictive. EIP-8141 authenticates signature entries before frame execution, and a later payer approval covers the transaction's complete gas budget, including earlier frames. Treating pre-payment configuration as bounded validation-prefix work therefore permits install-and-first-use without creating a second transaction format.
+It was unnecessarily restrictive. [EIP-8141](./eip-8141.md) authenticates signature entries before frame execution, and a later payer approval covers the transaction's complete gas budget, including earlier frames. Treating pre-payment configuration as bounded validation-prefix work therefore permits install-and-first-use without creating a second transaction format.
 
 The DoS concern is addressed by validation gas/state bounds and recognized profiles, not by prohibiting the ordering entirely.
 
@@ -792,13 +792,13 @@ Many authority updates do not change account code identity. Requiring a descript
 
 A nonzero length supports descriptor-only and combined descriptor-plus-state migration in the same frame.
 
-### Why signatures remain in the EIP-8141 list
+### Why signatures remain in the [EIP-8141](./eip-8141.md) list
 
 The signature list provides one location for protocol validation, witness elision, future aggregation, and signatures consumed during ordinary execution. Structured authority changes how authenticated results are authorized; it does not create a second signature container.
 
 ### Validation after execution
 
-Account authority must be established before a `SENDER` frame. Post-execution assertions, zero-slippage protection, and similar revert-protection schemes are orthogonal and may be evaluated later where EIP-8141 ordering and public-mempool policy permit.
+Account authority must be established before a `SENDER` frame. Post-execution assertions, zero-slippage protection, and similar revert-protection schemes are orthogonal and may be evaluated later where [EIP-8141](./eip-8141.md) ordering and public-mempool policy permit.
 
 ### Scope boundaries
 
@@ -835,11 +835,11 @@ The descriptor stores an address rather than an expected runtime code hash. An i
 
 #### Existing non-frame accounts
 
-`CONFIGURE` can migrate code-less accounts and smart accounts that already support EIP-8141 validation. ERC-4337-only accounts that cannot approve a frame transaction still need an implementation-specific upgrade or migration path.
+`CONFIGURE` can migrate code-less accounts and smart accounts that already support [EIP-8141](./eip-8141.md) validation. [ERC-4337](./eip-4337.md)-only accounts that cannot approve a frame transaction still need an implementation-specific upgrade or migration path.
 
 #### Validation gas budget
 
-Pure authentication, pre-payment configuration, sender authorization, and payer authorization must fit the active EIP-8141 public-mempool validation budget. Expensive post-quantum verification or multiple custom authenticators may require separate authentication and authorization budgets or a larger cap.
+Pure authentication, pre-payment configuration, sender authorization, and payer authorization must fit the active [EIP-8141](./eip-8141.md) public-mempool validation budget. Expensive post-quantum verification or multiple custom authenticators may require separate authentication and authorization budgets or a larger cap.
 
 #### Configuration and subsequent execution atomicity
 
@@ -847,9 +847,9 @@ A pre-payment configuration is reverted if later validation fails or no payer is
 
 ## Backwards Compatibility
 
-This proposal requires a network upgrade because it assigns special semantics to `0xef02`, extends EIP-8141 signature introspection and `APPROVE`, and adds a frame mode.
+This proposal requires a network upgrade because it assigns special semantics to `0xef02`, extends [EIP-8141](./eip-8141.md) signature introspection and `APPROVE`, and adds a frame mode.
 
-EIP-3541 prevents newly deployed ordinary code beginning with `0xef`, so existing deployable EVM contracts are not reinterpreted as structured accounts.
+[EIP-3541](./eip-3541.md) prevents newly deployed ordinary code beginning with `0xef`, so existing deployable EVM contracts are not reinterpreted as structured accounts.
 
 Pre-upgrade clients reject structured descriptors and do not understand the new signature attributes, `CONFIGURE` mode, or `APPROVE_CONFIGURE` action.
 
@@ -936,9 +936,9 @@ Implementations MUST cover at least the following cases.
 
 ### Code replacement
 
-1. Confirm EIP-7702 authorization cannot overwrite structured code.
-2. Confirm EIP-8298 cannot replace a structured descriptor.
-3. Confirm a structured descriptor cannot be used as an EIP-8298 source.
+1. Confirm [EIP-7702](./eip-7702.md) authorization cannot overwrite structured code.
+2. Confirm [EIP-8298](./eip-8298.md) cannot replace a structured descriptor.
+3. Confirm a structured descriptor cannot be used as an [EIP-8298](./eip-8298.md) source.
 
 ## Security Considerations
 
@@ -988,7 +988,7 @@ Installing a stateful verification implementation without initialized authority 
 
 ### Descriptor installation discards prior code
 
-Installing a structured descriptor overwrites the account's previous code, including an EIP-7702 delegation indicator or a complete smart-account implementation. Wallets MUST point `execution_implementation` at equivalent logic before installation -- for example, the previous runtime code already deployed at another address. The discarded code cannot be recovered from the descriptor.
+Installing a structured descriptor overwrites the account's previous code, including an [EIP-7702](./eip-7702.md) delegation indicator or a complete smart-account implementation. Wallets MUST point `execution_implementation` at equivalent logic before installation -- for example, the previous runtime code already deployed at another address. The discarded code cannot be recovered from the descriptor.
 
 ### Legacy signatures
 
