@@ -72,7 +72,7 @@ The useful parts of both designs can be combined into one native account model:
 
 The common single-root case requires no state lookup beyond the account descriptor. Richer accounts may select a dedicated verification implementation that uses account storage, a deterministic per-account authority contract, a shared keystore, immutable code data, a committed root, or another authority representation.
 
-The core protocol deliberately does not select among those storage models. The selected verification implementation owns its ABI, state layout, actor mapping, scope model, expiry model, and update mechanism. A chain may recognize selected verification implementation code hashes for public-mempool admission or equivalent direct evaluation without constraining the account's ordinary execution implementation.
+The core protocol deliberately does not select among those storage models. The selected verification implementation owns its ABI, state layout, authority mapping, scope model, expiry model, and update mechanism. A chain may recognize selected verification implementation code hashes for public-mempool admission or equivalent direct evaluation without constraining the account's ordinary execution implementation.
 
 Configuration also needs the same separation. Changing the descriptor and changing verification-owned data are distinct operations:
 
@@ -291,7 +291,7 @@ The implementation decides where authority state lives. It MAY use, among other 
 - a committed root plus transaction proofs; or
 - no mutable state at all.
 
-The base protocol assigns no ABI, calldata format, storage layout, actor mapping, scope encoding, expiry encoding, or keystore address to this authority type.
+The base protocol assigns no ABI, calldata format, storage layout, authority mapping, scope encoding, expiry encoding, or keystore address to this authority type.
 
 ### Mode-sensitive code selection
 
@@ -328,7 +328,7 @@ This is protocol code selection analogous to [EIP-7702](./eip-7702.md) delegated
 
 The code bytes are loaded directly from the selected implementation address without recursively resolving an [EIP-7702](./eip-7702.md) indicator or another structured descriptor at that address.
 
-While the current frame mode is `VERIFY` or `CONFIGURE`, a nested code-executing operation targeting that frame's `resolved_target` MUST select the same verification implementation rather than the execution implementation. This prevents a self-call from switching the authority path into arbitrary wallet execution code.
+While the current frame mode is `VERIFY` or `CONFIGURE`, a nested code-executing operation targeting that frame's `resolved_target` MUST select the same code source the frame selected -- the verification implementation, or the account's existing code on the installation path -- rather than the execution implementation. This prevents a self-call from switching the authority path into arbitrary wallet execution code.
 
 Outside that case, any code-executing operation targeting a structured account -- including a call from an unrelated contract, from another account's frame, or during ordinary execution -- loads code from `execution_implementation`. The structured descriptor itself is never executed as bytecode.
 
@@ -549,7 +549,7 @@ When `new_descriptor_length > 0`, the indicated descriptor is installed or repla
 
 If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before calling `APPROVE_CONFIGURE`. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
 
-If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. An out-of-bounds index or an entry that does not produce an `AuthenticationResult` is a configuration failure. The referenced canonical-hash signature MUST produce an `AuthenticationResult` matching the current inline root. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
+If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. The referenced canonical-hash entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol applies effects equivalent to successful `APPROVE_CONFIGURE` and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
 
 If `tx.sender` is not yet structured, the installation path depends on the account's current code. `sender_approved` alone never authorizes installation for an account with code: [EIP-8141](./eip-8141.md) execution approval permits frames to call on the account's behalf; it is not consent to replace account code.
 
@@ -769,7 +769,7 @@ A public-mempool profile admitting pre-payment configuration MUST define:
 9. the behavior of subsequent `VERIFY` frames against the temporary overlay; and
 10. an optional gas- and behavior-equivalent direct evaluator.
 
-A canonical [EIP-8130](./eip-8130.md)-style actor-authority profile can use this mechanism to install an actor and immediately validate it without a separate transaction or account-change envelope.
+A canonical [EIP-8130](./eip-8130.md)-style verification profile can use this mechanism to install an actor authorization and immediately validate it without a separate transaction or account-change envelope.
 
 #### Post-payment configuration
 
@@ -856,7 +856,7 @@ Account authority must be established before a `SENDER` frame. Post-execution as
 This proposal intentionally does not define:
 
 - one mandatory keystore address or storage layout;
-- actor scopes, expiry packing, recovery, guardians, or session policy;
+- authorization scopes, expiry packing, recovery, guardians, or session policy;
 - how a verification implementation stores or synchronizes authority state;
 - keyed or two-dimensional nonces;
 - nonce-free authorization;
