@@ -2,7 +2,7 @@
 title: Structured Account Authority
 description: Separate account execution from typed account-context verification.
 author: Taek (@leekt)
-discussions-to: https://ethereum-magicians.org/t/eip-8397-frame-authenticator-signatures/29517
+discussions-to: TBD
 status: Draft
 type: Standards Track
 category: Core
