@@ -457,7 +457,7 @@ If `payer == None` when the `CONFIGURE` frame begins, the configuration is a **p
 
 If no payer is established by transaction end, or a later `VERIFY` frame makes the transaction invalid, all pre-payment configuration effects are reverted with the transaction.
 
-`APPROVE_CONFIGURE` is permitted in a `CONFIGURE` frame carrying `ATOMIC_BATCH_FLAG` only when `payer` was already set at frame entry. Existing execution/payment approvals remain unavailable inside an atomic batch.
+`APPROVE_CONFIGURE` is permitted in a `CONFIGURE` frame belonging to an atomic batch only when `payer` was already set at frame entry. Existing execution/payment approvals remain unavailable inside an atomic batch.
 
 ### `CONFIGURE` frame
 
@@ -473,7 +473,7 @@ The static frame constraint becomes:
 assert frame.mode < 4
 ```
 
-[EIP-8141](./eip-8141.md)'s flag-validity table is extended: `ATOMIC_BATCH_FLAG` (bit 2) becomes valid on `DEFAULT`, `SENDER`, and `CONFIGURE` frames. A `CONFIGURE` frame carrying it additionally requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that no validation-prefix frame carries the flag.
+[EIP-8141](./eip-8141.md)'s flag-validity table is extended: `ATOMIC_BATCH_FLAG` (bit 2) becomes valid on `DEFAULT`, `SENDER`, and `CONFIGURE` frames. A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- additionally requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
 
@@ -496,7 +496,7 @@ The frame is structurally valid only when:
 5. a nonzero `new_descriptor_length` fits within `frame.data` and the selected bytes parse under an active authority type.
 6. at most one `CONFIGURE` frame appears in the transaction.
 7. no `SENDER` frame precedes it.
-8. if `payer == None` at frame entry, `ATOMIC_BATCH_FLAG` is not set.
+8. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
 
 At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame.
 
@@ -562,6 +562,12 @@ If `tx.sender` is not yet structured, the installation path depends on the accou
 The current descriptor always determines which authority authorizes configuration. The proposed descriptor is never used before installation.
 
 ```python
+def frame_in_atomic_batch(i, frames):
+    return (
+        frames[i].flags & ATOMIC_BATCH_FLAG
+        or (i > 0 and frames[i - 1].flags & ATOMIC_BATCH_FLAG)
+    )
+
 def execute_structured_configure(frame, current_descriptor, tx, state):
     assert resolved_target(frame) == tx.sender
     assert frame.flags & APPROVE_SCOPE_MASK == 0
@@ -569,7 +575,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
 
     prepayment = payer is None
     if prepayment:
-        assert not (frame.flags & ATOMIC_BATCH_FLAG)
+        assert not frame_in_atomic_batch(frame.index, tx.frames)
 
     charge_execution_gas(frame, CONFIGURE_BASE_GAS)
 
@@ -943,7 +949,7 @@ Implementations MUST cover at least the following cases.
 5. Confirm it terminates the top-level configuration call frame successfully.
 6. Reject it from a nested `CALL`, `DELEGATECALL`, or `CALLCODE` frame.
 7. Confirm a normal return without approval rolls back all configuration state changes.
-8. Reject `ATOMIC_BATCH_FLAG` on a pre-payment configuration.
+8. Reject a pre-payment configuration that carries `ATOMIC_BATCH_FLAG` or terminates an atomic batch begun by its predecessor.
 
 ### Pre-payment configuration
 
