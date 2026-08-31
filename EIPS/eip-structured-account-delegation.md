@@ -613,12 +613,12 @@ When `new_descriptor_length > 0`, the indicated descriptor is installed or repla
 
 If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before halting. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
 
-If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures`. The referenced canonical-hash entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol treats this validation as the configuration license and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
+If the current account is `INLINE_ROOT`, `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures` whose `msg` is empty or equals `compute_configure_hash(tx)`. The referenced entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol treats this validation as the configuration license and installs the new descriptor. No implementation-defined authority-state mutation occurs on this direct path.
 
-If `tx.sender` is not yet structured, the installation path depends on the account's current code. `sender_approved` alone never authorizes installation for an account with code: [EIP-8141](./eip-8141.md) execution approval permits frames to call on the account's behalf; it is not consent to replace account code.
+If `tx.sender` is not yet structured, the installation path depends on the account's current code. `sender_approved` never authorizes installation: [EIP-8141](./eip-8141.md) execution approval permits frames to call on the account's behalf; it is not consent to replace account code.
 
-- **Code-less account.** `configuration_data` MUST be empty and `sender_approved` MUST already be true. A code-less account can only have been approved through the [EIP-8141](./eip-8141.md) default-account path, so the approval is the account's canonical secp256k1 root signature. The protocol treats this validation as the configuration license and installs the descriptor.
-- **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry with empty `msg` whose recovered address equals `tx.sender`. That key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The protocol treats this validation as the configuration license and installs the descriptor, replacing the delegation indicator.
+- **Code-less account.** `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry whose recovered address equals `tx.sender` and whose `msg` is empty or equals `compute_configure_hash(tx)`. The account's own key is the protocol root authority. The protocol treats this validation as the configuration license and installs the descriptor.
+- **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** `configuration_data` MUST contain exactly one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry whose recovered address equals `tx.sender` and whose `msg` is empty or equals `compute_configure_hash(tx)`. That key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The protocol treats this validation as the configuration license and installs the descriptor, replacing the delegation indicator.
 - **Account with any other code.** The account's own validation code MUST first approve `APPROVE_CONFIGURE` from its `VERIFY` frame; the `CONFIGURE` frame then executes the account's existing code in the non-static configuration context and succeeds on normal halt. An account whose validation code cannot approve `APPROVE_CONFIGURE` requires a wallet-specific upgrade before it can become structured.
 
 #### Applying configuration
@@ -626,6 +626,14 @@ If `tx.sender` is not yet structured, the installation path depends on the accou
 The current descriptor always determines which authority authorizes configuration. The proposed descriptor is never used before installation.
 
 ```python
+def direct_path_signature(configuration_data, tx):
+    assert len(configuration_data) == 4
+    sig_index = int.from_bytes(configuration_data, "big")
+    assert sig_index < len(tx.signatures)
+    sig = tx.signatures[sig_index]
+    assert len(sig.msg) == 0 or sig.msg == compute_configure_hash(tx)
+    return sig
+
 def frame_in_atomic_batch(i, frames):
     return (
         frames[i].flags & ATOMIC_BATCH_FLAG
@@ -657,17 +665,9 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     if current_descriptor is None:
         assert new_descriptor is not None
         code = state[tx.sender].code
-        if len(code) == 0:
-            assert sender_approved
-            assert len(configuration_data) == 0
-            configuration_approved = True
-        elif is_eip7702_indicator(code):
-            assert len(configuration_data) == 4
-            sig_index = int.from_bytes(configuration_data, "big")
-            assert sig_index < len(tx.signatures)
-            sig = tx.signatures[sig_index]
+        if len(code) == 0 or is_eip7702_indicator(code):
+            sig = direct_path_signature(configuration_data, tx)
             assert sig.scheme == SECP256K1
-            assert len(sig.msg) == 0
             assert sig.key_id == bytes32(tx.sender)
             configuration_approved = True
         else:
@@ -681,11 +681,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
 
     elif current_descriptor.authority_type == INLINE_ROOT:
         assert new_descriptor is not None
-        assert len(configuration_data) == 4
-        sig_index = int.from_bytes(configuration_data, "big")
-        assert sig_index < len(tx.signatures)
-        sig = tx.signatures[sig_index]
-        assert len(sig.msg) == 0
+        sig = direct_path_signature(configuration_data, tx)
         assert produces_authentication_result(sig)
         assert authorize_inline_root(
             current_descriptor,
@@ -771,7 +767,7 @@ The execution implementation is intentionally independent from the authority imp
 
 [EIP-7702](./eip-7702.md) authorization processing MUST NOT overwrite structured code.
 
-Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current root-equivalent authority: the current structured descriptor's authority path; the default-account root signature for a code-less account; the account's own secp256k1 key for an [EIP-7702](./eip-7702.md) delegation indicator; or the account's own validation code approving the `APPROVE_CONFIGURE` scope. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
+Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current root-equivalent authority: the current structured descriptor's authority path; the account's own secp256k1 key for a code-less account or an [EIP-7702](./eip-7702.md) delegation indicator; or the account's own validation code approving the `APPROVE_CONFIGURE` scope. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
 
 [EIP-8298](./eip-8298.md) `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid [EIP-8298](./eip-8298.md) source. Otherwise ordinary execution code could replace the authority descriptor outside `CONFIGURE`.
 
@@ -820,7 +816,7 @@ A pre-payment configuration is evaluated on a temporary state overlay. Every lat
 
 #### Directly evaluable pre-configuration
 
-An inline-root descriptor replacement, a code-less-account installation, and an [EIP-7702](./eip-7702.md)-indicator installation are directly evaluable without executing EVM code. Their dependencies are the current account code (descriptor, emptiness, or delegation indicator), the referenced signature result where one is used, `sender_approved` for the code-less path, the proposed descriptor, and the later validation-prefix dependencies.
+An inline-root descriptor replacement, a code-less-account installation, and an [EIP-7702](./eip-7702.md)-indicator installation are directly evaluable without executing EVM code. Their dependencies are the current account code (descriptor, emptiness, or delegation indicator), the referenced signature result, the proposed descriptor, and the later validation-prefix dependencies.
 
 #### Verification-implementation pre-configuration
 
@@ -1048,8 +1044,8 @@ Implementations MUST cover at least the following cases.
 
 ### Installation
 
-1. Install a descriptor on a code-less account after default-account approval.
-2. Install over an [EIP-7702](./eip-7702.md) delegation indicator with the account's own canonical secp256k1 signature; reject any other signer, scheme, or non-empty `msg`.
+1. Install a descriptor on a code-less account with the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`.
+2. Install over an [EIP-7702](./eip-7702.md) delegation indicator with the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`.
 3. Reject direct installation on an account with contract code; require a configure approval from that account's own `VERIFY` frame.
 4. Reject installation on a smart account whose transaction was execution-approved by a restricted credential and whose code does not approve configuration.
 
@@ -1127,7 +1123,7 @@ Installing a stateful verification implementation without initialized authority 
 
 ### Execution approval is not configuration authority
 
-[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority for an account with code would let such a credential replace the account's code and seize root authority. Installation paths therefore accept `sender_approved` only for code-less accounts, where it is necessarily the account's root signature. Configuration authority is tracked as the separate `configure_approved` value, which only a `VERIFY`-frame `APPROVE` in the account's own context (or a direct protocol path) can establish.
+[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority would let such a credential replace the account's code and seize root authority. No installation or configuration path therefore consults `sender_approved`: direct protocol paths verify a root-equivalent signature themselves, and every other path requires the separate `configure_approved` value, which only a `VERIFY`-frame `APPROVE` in the account's own context can establish.
 
 The same rule applies inside verification implementations. Code deciding whether to approve `APPROVE_CONFIGURE` MUST derive that decision from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority. It MUST bind the approval to the exact `CONFIGURE` frame payload, which it can read through frame introspection before approving.
 
