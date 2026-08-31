@@ -648,6 +648,8 @@ EIP-3541 is modified to permit creation-time installation of code beginning with
 
 EIP-7702 authorization processing MUST NOT overwrite structured code.
 
+Descriptor installation through `CONFIGURE` MAY replace empty code, an EIP-7702 delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current authority: the current structured descriptor's authority path, or, for a not-yet-structured account, the EIP-8141 validation path that set `sender_approved`. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
+
 EIP-8298 `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid EIP-8298 source. Otherwise ordinary execution code could replace the authority descriptor outside `CONFIGURE`.
 
 Any future account-code replacement mechanism MUST explicitly specify whether it may replace structured code. The default is that it may not.
@@ -981,6 +983,10 @@ A pre-payment configuration is provisional through later validation and payer se
 ### Bootstrap lockout
 
 Installing a stateful verification implementation without initialized authority state may permanently lock the account. Wallets must initialize the destination authority first or use a standardized bootstrap profile.
+
+### Descriptor installation discards prior code
+
+Installing a structured descriptor overwrites the account's previous code, including an EIP-7702 delegation indicator or a complete smart-account implementation. Wallets MUST point `execution_implementation` at equivalent logic before installation -- for example, the previous runtime code already deployed at another address. The discarded code cannot be recovered from the descriptor.
 
 ### Legacy signatures
 
