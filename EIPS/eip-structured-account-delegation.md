@@ -330,6 +330,8 @@ The code bytes are loaded directly from the selected implementation address with
 
 While the current frame mode is `VERIFY` or `CONFIGURE`, a nested code-executing operation targeting that frame's `resolved_target` MUST select the same verification implementation rather than the execution implementation. This prevents a self-call from switching the authority path into arbitrary wallet execution code.
 
+Outside that case, any code-executing operation targeting a structured account -- including a call from an unrelated contract, from another account's frame, or during ordinary execution -- loads code from `execution_implementation`. The structured descriptor itself is never executed as bytecode.
+
 ### Account-context verification
 
 A `VERIFY` frame targeting a `VERIFY_IMPLEMENTATION` account executes with:
