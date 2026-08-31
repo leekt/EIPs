@@ -423,6 +423,24 @@ This proposal extends the [EIP-8141](./eip-8141.md) `APPROVE` instruction with t
 
 Existing `APPROVE_PAYMENT`, `APPROVE_EXECUTION`, and `APPROVE_EXECUTION_AND_PAYMENT` behavior is unchanged in `VERIFY` mode. `APPROVE_CONFIGURE` is invalid in `VERIFY`, `DEFAULT`, and `SENDER` modes.
 
+[EIP-8141](./eip-8141.md)'s existing scope check (`scope != 0 and scope & ~(frame.flags & APPROVE_SCOPE_MASK) == 0`) would reject `APPROVE_CONFIGURE` unconditionally, because `0x10` is never part of `frame.flags`. The instruction's entry is therefore redefined as an explicit mode dispatch:
+
+```python
+def approve(scope, offset, length):
+    if not is_frame_transaction():
+        exceptional_halt()
+    if frame.mode == CONFIGURE:
+        if scope != APPROVE_CONFIGURE:
+            revert()
+        execute_approve_configure(offset, length)
+    else:
+        if scope == APPROVE_CONFIGURE:
+            revert()
+        execute_existing_eip8141_approve(scope, offset, length)
+```
+
+In `CONFIGURE` mode the existing execution/payment scope check never runs. In every other mode existing [EIP-8141](./eip-8141.md) behavior is unchanged; the explicit `APPROVE_CONFIGURE` rejection is equivalent to the existing scope check, which `0x10` can never satisfy.
+
 When `APPROVE` is executed with `scope == APPROVE_CONFIGURE` in a `CONFIGURE` frame:
 
 1. If `ADDRESS != resolved_target`, revert the current call frame.
@@ -454,6 +472,8 @@ The static frame constraint becomes:
 ```python
 assert frame.mode < 4
 ```
+
+[EIP-8141](./eip-8141.md)'s flag-validity table is extended: `ATOMIC_BATCH_FLAG` (bit 2) becomes valid on `DEFAULT`, `SENDER`, and `CONFIGURE` frames. A `CONFIGURE` frame carrying it additionally requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that no validation-prefix frame carries the flag.
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
 
