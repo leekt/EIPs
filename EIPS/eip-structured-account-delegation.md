@@ -744,13 +744,13 @@ Public-mempool implementations MUST recognize the forms:
 [pre_configure, only_verify, pay]
 ```
 
-when `pre_configure` is a directly evaluable inline-root descriptor replacement, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation remains profile-dependent (see below).
+when `pre_configure` is directly evaluable: an inline-root descriptor replacement, a code-less-account installation, or an [EIP-7702](./eip-7702.md)-indicator installation, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation or existing account code remains profile-dependent (see below).
 
 A pre-payment configuration is evaluated on a temporary state overlay. Every later validation frame observes that overlay. The overlay is discarded if the transaction is rejected, replaced, evicted, becomes invalid, or fails to establish a payer.
 
-#### Inline-root pre-configuration
+#### Directly evaluable pre-configuration
 
-An inline-root descriptor replacement is directly evaluable. Its dependencies are the current descriptor, the referenced current-root signature result, the proposed descriptor, and the later validation-prefix dependencies.
+An inline-root descriptor replacement, a code-less-account installation, and an [EIP-7702](./eip-7702.md)-indicator installation are directly evaluable without executing EVM code. Their dependencies are the current account code (descriptor, emptiness, or delegation indicator), the referenced signature result where one is used, `sender_approved` for the code-less path, the proposed descriptor, and the later validation-prefix dependencies.
 
 #### Verification-implementation pre-configuration
 
@@ -987,7 +987,7 @@ Implementations MUST cover at least the following cases.
 
 ### Public mempool
 
-1. Admit directly evaluable inline-root pre-configuration.
+1. Admit directly evaluable pre-configuration: inline-root replacement, code-less installation, and delegation-indicator installation.
 2. Reject unrecognized state-changing pre-payment verification implementations from generic propagation.
 3. Admit a recognized profile with bounded reads, writes, calls, and gas.
 4. Change a declared dependency and revalidate the transaction and temporary overlay.
