@@ -514,11 +514,20 @@ This form is valid only when the current account is a structured `VERIFY_IMPLEME
 | Property | Value |
 |---|---|
 | code source | current `verification_implementation` |
-| `ADDRESS` | structured account |
+| `ADDRESS` | structured account (`resolved_target`) |
+| persistent storage | structured account storage |
+| transient storage | structured account transient storage |
+| top-level `CALLER` | [EIP-8141](./eip-8141.md) `ENTRY_POINT` |
+| `ORIGIN` | [EIP-8141](./eip-8141.md) frame caller |
+| `CALLVALUE` | `0` |
 | calldata | complete `frame.data`, unchanged |
 | static mode | disabled |
 | frame mode | `CONFIGURE_MODE` |
 | gas pools | frame-declared [EIP-8141](./eip-8141.md) limits |
+| `CODESIZE`, `CODECOPY` | verification implementation code |
+| `EXTCODE*` of `ADDRESS` | current structured descriptor code |
+| `SELFBALANCE` | structured account balance |
+| nested self-call dispatch | current verification implementation |
 
 The implementation authenticates the current root, administrator, recovery path, multisig, or other authority according to its own rules; mutates its chosen authority state; and finally invokes `APPROVE(APPROVE_CONFIGURE)`.
 
@@ -722,14 +731,14 @@ A direct evaluator MUST reproduce equivalent EVM gas, warmness, returndata, stat
 
 A `CONFIGURE` frame occurring while `payer == None` is part of the [EIP-8141](./eip-8141.md) validation prefix. Its execution and state-gas limits count toward the active `MAX_VERIFY_GAS` and `MAX_VERIFY_STATE_GAS` bounds.
 
-Public-mempool implementations MAY recognize forms equivalent to:
+Public-mempool implementations MUST recognize the forms:
 
 ```text
 [pre_configure, self_verify]
 [pre_configure, only_verify, pay]
 ```
 
-as well as the existing optional expiry/deploy variants, provided the applicable profile defines their exact ordering and dependencies.
+when `pre_configure` is a directly evaluable inline-root descriptor replacement, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation remains profile-dependent (see below).
 
 A pre-payment configuration is evaluated on a temporary state overlay. Every later validation frame observes that overlay. The overlay is discarded if the transaction is rejected, replaced, evicted, becomes invalid, or fails to establish a payer.
 
