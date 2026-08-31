@@ -49,7 +49,7 @@ A new `CONFIGURE` frame mode and mode-specific `APPROVE_CONFIGURE` action suppor
 
 `CONFIGURE` may execute before transaction payment is approved. This permits an existing administrator to install a new credential authorization and a later `VERIFY` frame in the same transaction to authorize execution or payment with that new credential.
 
-This combines [EIP-8141](./eip-8141.md)'s frame transaction, payment, execution, and signature container with [EIP-8130](./eip-8130.md)'s `authenticator -> actor identity -> authorization` model. It does not define a second transaction envelope, a second signature namespace, or a mandatory keystore layout.
+This proposal keeps [EIP-8141](./eip-8141.md)'s frame transaction, payment, execution, and signature container unchanged, and defines the account-side authentication-result and authorization-dispatch surface on which an [EIP-8130](./eip-8130.md)-style `authenticator -> actor identity -> authorization` profile can be built. It does not define a second transaction envelope, a second signature namespace, a mandatory keystore layout, or an actor model.
 
 ## Motivation
 
