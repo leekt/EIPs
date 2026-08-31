@@ -668,6 +668,8 @@ Verification-implementation authorization uses the frame's ordinary EIP-8141 exe
 
 `CONFIGURE` runs non-statically for `VERIFY_IMPLEMENTATION` and may consume both execution and state gas. All calls, storage writes, account creation, logs, and external effects are charged normally. `CONFIGURE_BASE_GAS` additionally covers configuration dispatch and optional descriptor replacement bookkeeping.
 
+`charge_descriptor_write` charges descriptor installation or replacement as state growth: `max(0, len(new_descriptor) - len(current_code)) * CPSB` is deducted from the frame's `state_gas_left` immediately before the code write, using the same per-state-byte accounting as EIP-8141's account-creation charge. A shrinking or equal-size replacement charges no growth. The dispatch cost of the write is covered by `CONFIGURE_BASE_GAS`; there is no separate per-byte execution-gas charge.
+
 When configuration precedes payer approval, its consumed gas and state gas are still included in the transaction's total usage and maximum cost. The later payer approval therefore escrows and ultimately pays for work already performed earlier in the frame sequence. If no payer is established, the transaction is invalid and cannot be included.
 
 `APPROVE_CONFIGURE` has the same memory-expansion and return-data cost behavior as existing `APPROVE`. It has no additional execution-gas base cost.
