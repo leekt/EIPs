@@ -477,6 +477,13 @@ assert frame.mode < 4
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
 
+`CONFIGURE` composes with `VERIFY` in either order:
+
+- A `CONFIGURE` frame MUST be accepted before any `VERIFY` frame, including the sender's, provided it succeeds through `APPROVE_CONFIGURE` or a direct protocol path. Later validation frames observe its effects; this ordering is the install-and-first-use construction.
+- A `CONFIGURE` frame MAY follow `VERIFY` frames, executing as an ordinary paid frame once a payer is set.
+
+The same canonical-hash signature entry may authorize both frames: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the two modes duplicates no witness and repeats no cryptographic verification. In both orders a `CONFIGURE` frame never inherits authority from another frame: it succeeds only through `APPROVE_CONFIGURE` or a direct protocol path, regardless of `sender_approved` or `payer` state.
+
 Its data is:
 
 ```text
@@ -1050,6 +1057,8 @@ Installing a stateful verification implementation without initialized authority 
 ### Execution approval is not configuration authority
 
 [EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority for an account with code would let such a credential replace the account's code and seize root authority. Installation paths therefore accept `sender_approved` only for code-less accounts, where it is necessarily the account's root signature.
+
+The same rule applies inside verification implementations. Code running in `CONFIGURE` mode after an earlier `VERIFY` frame MUST derive configuration authority from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority.
 
 ### Descriptor installation discards prior code
 
