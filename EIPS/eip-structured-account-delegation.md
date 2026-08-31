@@ -500,6 +500,8 @@ Because the approving code runs while the transaction's frame list is introspect
 
 Approving `APPROVE_CONFIGURE` does not require `payer` to be set. It does not set `sender_approved`, does not select or change `payer`, does not increment a nonce, and does not collect maximum cost.
 
+`configure_approved` joins [EIP-8141](./eip-8141.md)'s journaled approval context alongside `payer` and `sender_approved`: transaction initialization leaves all three unset, and every rollback boundary that restores the approval context -- a reverted nested call, a failed or reverted frame, an unrolled atomic batch, or transaction failure -- restores `configure_approved` with it. In a combined approval such as `APPROVE(APPROVE_CONFIGURE | APPROVE_PAYMENT)`, a revert while applying the execution/payment effects rolls the configuration approval back with the call frame; a partially applied combined approval never survives.
+
 If `payer == None` when the `CONFIGURE` frame begins, the configuration is a **pre-payment configuration** and belongs to the transaction's validation prefix. Its effects remain part of the transaction journal and are visible to later frames. They commit only if a later frame successfully establishes a payer and the transaction remains valid.
 
 If no payer is established by transaction end, or a later `VERIFY` frame makes the transaction invalid, all pre-payment configuration effects are reverted with the transaction.
@@ -1024,6 +1026,7 @@ Implementations MUST cover at least the following cases.
 6. Reject a code-executing `CONFIGURE` frame with no preceding configure-approving `VERIFY` frame.
 7. Confirm a licensed `CONFIGURE` frame succeeds on normal halt, and rolls back all configuration state changes on revert or exceptional halt.
 8. Reject a pre-payment configuration that carries `ATOMIC_BATCH_FLAG` or terminates an atomic batch begun by its predecessor.
+9. Roll back `configure_approved` when a combined `APPROVE` fails its payment effects, when the approving frame reverts, and when an atomic batch unrolls.
 
 ### Pre-payment configuration
 
