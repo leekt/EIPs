@@ -549,9 +549,9 @@ assert frame.flags < 16
 | `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` |
 | `4+` | reserved | no frame |
 
-A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
+A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 7 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
 
-A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
+A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval, and before or after `SENDER` frames.
 
 Every `CONFIGURE` frame MUST be preceded by a `VERIFY` frame that approved `APPROVE_CONFIGURE`, and `configure_approved` MUST be true at `CONFIGURE` frame entry. There are no exempt paths. Accounts whose authority is protocol-native -- inline-root, code-less, and delegation-indicator accounts -- obtain the approval through the root-licensing rules above, which verify the root-equivalent signature without executing code.
 
@@ -584,10 +584,9 @@ The frame is structurally valid only when:
 4. `frame.value == 0`.
 5. a nonzero `new_descriptor_length` fits within `frame.data` and the selected bytes parse under an active authority type.
 6. at most one `CONFIGURE` frame appears in the transaction.
-7. no `SENDER` frame precedes it.
-8. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
-9. an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
-10. if the current account is inline-root, code-less, or carries a delegation indicator, `configuration_data` is nonempty only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
+7. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
+8. an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
+9. if the current account is inline-root, code-less, or carries a delegation indicator, `configuration_data` is nonempty only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
 
 At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame.
 
@@ -652,7 +651,7 @@ If `tx.sender` is not yet structured, the installation path depends on the accou
 
 On each protocol installation path -- an inline-root, code-less, or delegation-indicator account -- any `configuration_data` bytes form an OPTIONAL bootstrap initialization payload.
 
-A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 10 above). After the descriptor is installed, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor.
+A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 9 above). After the descriptor is installed, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor.
 
 The frame succeeds when the initialization code halts normally. A revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint, including the descriptor installation.
 
@@ -679,7 +678,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     assert frame.flags & APPROVE_SCOPE_MASK == 0
     assert frame.flags & APPROVE_CONFIGURE == 0
     assert frame.value == 0
-    assert configure_approved  # structural rule 9's runtime counterpart
+    assert configure_approved  # structural rule 8's runtime counterpart
     configure_approved = False  # consume; journaled with the frame
 
     prepayment = payer is None
@@ -707,7 +706,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     if protocol_install:
         assert new_descriptor is not None
         if len(configuration_data) != 0:
-            # structural rule 10: bootstrap payload
+            # structural rule 9: bootstrap payload
             assert authority_type_of(new_descriptor) == VERIFY_IMPLEMENTATION
         configuration_approved = True
 
@@ -982,9 +981,11 @@ It was unnecessarily restrictive. [EIP-8141](./eip-8141.md) authenticates signat
 
 The DoS concern is addressed by validation gas/state bounds and recognized profiles, not by prohibiting the ordering entirely.
 
-### Why no `SENDER` frame precedes `CONFIGURE`
+### Why `CONFIGURE` may follow `SENDER` frames
 
-`SENDER` frames begin the account's ordinary business execution under its established authority. Ordering every configuration ahead of them keeps a transaction's authority phase-coherent: authority is authenticated, licensed, and mutated first, and execution then runs under the resulting authority -- mirroring the existing rule that account authority is established before any `SENDER` frame. It also keeps authority mutation out of reach of business-execution outcomes: a configuration conditioned on the results of the account's own execution re-couples authority to wallet logic, and offers nothing a subsequent transaction cannot. Other frame modes may precede a post-payment `CONFIGURE` because validation and payment frames establish the transaction's authority and payment context rather than acting under it.
+An earlier draft prohibited any `SENDER` frame before `CONFIGURE`. Under uniform licensing the restriction lost its justification: the license is produced by an earlier `VERIFY` under the pre-configuration authority and commits to the exact configuration payload, so business execution running in between cannot change what was authorized -- only the state the licensed configuration code operates on, which that code already owns defensively. A `CONFIGURE` following a `SENDER` frame is post-payment by construction, so it is ordinary paid execution outside the validation prefix and adds no mempool work.
+
+The ordering enables a third bootstrap route: initialize authority state through ordinary execution -- deploy a verification implementation, initialize a per-account authority contract, write keystore entries -- and switch the descriptor in a final `CONFIGURE` frame, all in one transaction. The invariants are unaffected: at most one `CONFIGURE` exists, its licensing `VERIFY` still precedes it, and the authority approving the transaction's own execution was established before any `SENDER` frame ran.
 
 ### Why every configuration is licensed from a `VERIFY` frame
 
@@ -1139,6 +1140,7 @@ Implementations MUST cover at least the following cases.
 1. Update authority state after payment and approve configuration.
 2. Fail configuration after payment and record a failed paid frame without committing its state.
 3. Use an atomic batch after payment and roll configuration back when a later batch frame fails.
+4. Execute a `SENDER` frame, then a licensed `CONFIGURE` frame: initialize authority state through ordinary execution and switch the descriptor afterwards; confirm subsequent frames observe the new descriptor.
 
 ### Installation
 
