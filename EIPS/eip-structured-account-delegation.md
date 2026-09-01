@@ -46,7 +46,9 @@ A new `CONFIGURE` frame mode and an additional `APPROVE_CONFIGURE` approval scop
 
 1. replacing the structured descriptor;
 2. mutating authority state consumed by the current verification implementation; and
-3. bootstrapping a newly installed verification implementation's authority state on the direct installation paths.
+3. bootstrapping a newly installed verification implementation's authority state on the protocol installation paths.
+
+Every `CONFIGURE` frame is licensed by a preceding `VERIFY` frame that approved `APPROVE_CONFIGURE` under the account's current authentication. For inline-root, code-less, and delegation-indicator accounts the protocol performs that verification natively, without executing code.
 
 `CONFIGURE` may execute before transaction payment is approved. This permits an existing administrator to install a new credential authorization and a later `VERIFY` frame in the same transaction to authorize execution or payment with that new credential.
 
@@ -407,20 +409,32 @@ It succeeds only when:
 
 1. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`.
 2. `signature_index < len(tx.signatures)`.
-3. The referenced signature uses the canonical frame-transaction signing hash.
+3. The referenced signature's `msg` is empty, or equals `compute_configure_hash(tx)` when the requested scope is exactly `APPROVE_CONFIGURE`.
 4. The signature produces an `AuthenticationResult`.
 5. The result matches the descriptor's `(verifier, key_id)`.
-6. The frame requests a nonzero [EIP-8141](./eip-8141.md) approval scope.
+6. The frame requests a nonzero extended approval scope.
 7. Every ordinary [EIP-8141](./eip-8141.md) structural rule for that scope holds.
-8. `frame.flags & APPROVE_CONFIGURE == 0`. Inline-root configuration uses the direct protocol path, so the configure bit has no meaning here; its presence makes the transaction invalid rather than being silently ignored.
 
 On success, protocol applies the same effects as:
 
 ```text
-APPROVE(frame.flags & APPROVE_SCOPE_MASK)
+APPROVE(frame.flags & EXTENDED_APPROVE_SCOPE_MASK)
 ```
 
-No verification or execution implementation bytecode runs.
+No verification or execution implementation bytecode runs. The inline root is full account authority, so it may approve the `APPROVE_CONFIGURE` scope; a `CONFIGURE_HASH` signature licenses only that scope and never execution or payment.
+
+### Root configure licensing for code-less and delegated senders
+
+[EIP-8141](./eip-8141.md)'s default code natively approves execution and payment scopes for code-less accounts. This proposal extends protocol-native verification to the configure scope. A `VERIFY` frame is a **root-licensing frame** when it targets `tx.sender`, carries the `APPROVE_CONFIGURE` flag bit, and the account is code-less or carries an [EIP-7702](./eip-7702.md) delegation indicator. It succeeds only when:
+
+1. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`, containing one unsigned 32-bit big-endian signature index.
+2. The referenced signature is `SECP256K1` and its recovered address equals `tx.sender`.
+3. The signature's `msg` is empty, or equals `compute_configure_hash(tx)` when the requested scope is exactly `APPROVE_CONFIGURE`.
+4. Every ordinary [EIP-8141](./eip-8141.md) structural rule for the requested scope holds.
+
+On success, protocol applies the same effects as `APPROVE(frame.flags & EXTENDED_APPROVE_SCOPE_MASK)`. No default code, delegated code, or implementation bytecode runs.
+
+For a delegation-indicator account this deliberately bypasses the delegate for this frame only: the account key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, and existing delegates predate the configure scope. A `VERIFY` frame without the configure bit is unaffected and follows existing [EIP-8141](./eip-8141.md) dispatch, including delegate execution.
 
 ### Canonical configuration hash
 
@@ -455,7 +469,7 @@ A configuration authority may therefore use either signature form:
 - `sig.msg` empty -- the signature commits to the complete canonical frame transaction; or
 - `sig.msg == compute_configure_hash(tx)` -- the signature authorizes only the configuration.
 
-A configuration-only signature MUST NOT be used to authorize execution or payment. On the direct protocol paths this is protocol-enforced; a verification implementation MUST enforce it under its own policy, conceptually:
+A configuration-only signature MUST NOT be used to authorize execution or payment. On the protocol root-licensing paths this is protocol-enforced: a `CONFIGURE_HASH` signature may license only the `APPROVE_CONFIGURE` scope. A verification implementation MUST enforce it under its own policy, conceptually:
 
 ```text
 require(SIGPARAM(0x02, i) == TXPARAM(TXPARAM_CONFIGURE_HASH))
@@ -531,18 +545,18 @@ assert frame.flags < 16
 |---|---|---|
 | `0-1` | execution/payment approval scope | existing [EIP-8141](./eip-8141.md) rules |
 | `2` | `ATOMIC_BATCH_FLAG` | `DEFAULT`, `SENDER`, and post-payment `CONFIGURE` frames |
-| `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` and does not resolve to an `INLINE_ROOT` account |
+| `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` |
 | `4+` | reserved | no frame |
 
 A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval.
 
-Every `CONFIGURE` frame executing under the account's current authority code -- its existing code on the installation path or its current verification implementation -- MUST be preceded by a `VERIFY` frame that approved `APPROVE_CONFIGURE`, and `configure_approved` MUST be true at `CONFIGURE` frame entry. The direct protocol paths defined below (inline-root replacement, code-less installation, delegation-indicator installation) carry their own protocol-checked authorization -- including any bootstrap initialization they license -- and are exempt.
+Every `CONFIGURE` frame MUST be preceded by a `VERIFY` frame that approved `APPROVE_CONFIGURE`, and `configure_approved` MUST be true at `CONFIGURE` frame entry. There are no exempt paths. Accounts whose authority is protocol-native -- inline-root, code-less, and delegation-indicator accounts -- obtain the approval through the root-licensing rules above, which verify the root-equivalent signature without executing code.
 
 The licensing `VERIFY` frame MAY be the same frame that approves execution and payment -- one `APPROVE` with combined scope -- or a configure-only `VERIFY` frame, before or after payer approval. The same canonical-hash signature entry may support the licensing frame and any other frame: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the modes duplicates no witness and repeats no cryptographic verification. Later validation frames observe the configuration's effects, so a pre-payment licensing `VERIFY` plus `CONFIGURE` ahead of the remaining validation frames is the install-and-first-use construction.
 
-A `CONFIGURE` frame never authorizes itself and never inherits authority from `sender_approved` or `payer` state; only `configure_approved` or a direct protocol path licenses it.
+A `CONFIGURE` frame never authorizes itself and never inherits authority from `sender_approved` or `payer` state; only `configure_approved` licenses it.
 
 Its data is:
 
@@ -564,12 +578,12 @@ The frame is structurally valid only when:
 6. at most one `CONFIGURE` frame appears in the transaction.
 7. no `SENDER` frame precedes it.
 8. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
-9. unless the frame resolves to a direct protocol path, an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
-10. if the frame resolves to a direct protocol path, `configuration_data` bytes beyond the 4-byte signature index are present only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
+9. an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
+10. if the current account is inline-root, code-less, or carries a delegation indicator, `configuration_data` is nonempty only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
 
 At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame.
 
-A `CONFIGURE` frame executing current-authority code requires `configure_approved == true` at entry. Every executed configuration or bootstrap-initialization code path succeeds when it halts normally (`STOP` or `RETURN`); a revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint. Direct protocol paths authorize through their own validation rules.
+Every `CONFIGURE` frame requires `configure_approved == true` at entry. Every executed configuration or bootstrap-initialization code path succeeds when it halts normally (`STOP` or `RETURN`); a revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint. The protocol installation paths install without executing current-account code.
 
 - If the frame began before payer approval, any configuration failure, revert, or exceptional halt makes the frame transaction invalid.
 - If the frame began after payer approval, configuration failure produces a failed paid frame and the transaction may continue under ordinary frame semantics.
@@ -618,48 +632,46 @@ When `new_descriptor_length > 0`, the indicated descriptor is installed or repla
 
 If the current account is `VERIFY_IMPLEMENTATION`, the current verification implementation executes in the same non-static configuration context. It MAY also mutate verification-owned state before halting. On approval, both the state mutations and descriptor replacement remain in the transaction journal. This permits one frame to migrate authority data and switch verification implementations atomically at the frame level.
 
-If the current account is `INLINE_ROOT`, `configuration_data` MUST begin with one unsigned 32-bit big-endian signature index referencing an existing entry in `tx.signatures` whose `msg` is empty or equals `compute_configure_hash(tx)`. The referenced entry MUST produce an `AuthenticationResult` matching the current inline root; an out-of-bounds index or an entry without an `AuthenticationResult` is a configuration failure. The protocol treats this validation as the configuration license and installs the new descriptor. Any remaining `configuration_data` bytes form a bootstrap initialization payload (see below); when absent, no implementation-defined authority-state mutation occurs on this direct path.
+If the current account is `INLINE_ROOT`, the frame is a **protocol installation**: the licensing inline-root `VERIFY` frame already verified the root and approved `APPROVE_CONFIGURE`, and the inline root has no code and no implementation-defined mutable authority state, so the protocol installs the new descriptor without executing any current-account code. `configuration_data` MUST be empty unless it forms a bootstrap initialization payload (see below).
 
 If `tx.sender` is not yet structured, the installation path depends on the account's current code. `sender_approved` never authorizes installation: [EIP-8141](./eip-8141.md) execution approval permits frames to call on the account's behalf; it is not consent to replace account code.
 
-- **Code-less account.** `configuration_data` MUST begin with one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry whose recovered address equals `tx.sender` and whose `msg` is empty or equals `compute_configure_hash(tx)`. The account's own key is the protocol root authority. The protocol treats this validation as the configuration license and installs the descriptor.
-- **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** `configuration_data` MUST begin with one unsigned 32-bit big-endian signature index referencing an existing `SECP256K1` entry whose recovered address equals `tx.sender` and whose `msg` is empty or equals `compute_configure_hash(tx)`. That key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The protocol treats this validation as the configuration license and installs the descriptor, replacing the delegation indicator.
+- **Code-less account.** The licensing root-licensing `VERIFY` frame already verified the account's own secp256k1 key -- the protocol root authority -- and approved `APPROVE_CONFIGURE`. The frame is a protocol installation: the protocol installs the descriptor without executing code.
+- **Account with an [EIP-7702](./eip-7702.md) delegation indicator.** The licensing root-licensing `VERIFY` frame already verified the account key, which holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, so installation grants it nothing new. The frame is a protocol installation: the protocol installs the descriptor without executing code, replacing the delegation indicator.
 - **Account with any other code.** The account's own validation code MUST first approve `APPROVE_CONFIGURE` from its `VERIFY` frame; the `CONFIGURE` frame then executes the account's existing code in the non-static configuration context and succeeds on normal halt. An account whose validation code cannot approve `APPROVE_CONFIGURE` requires a wallet-specific upgrade before it can become structured.
 
-#### Bootstrap initialization on direct installation paths
+#### Bootstrap initialization on protocol installation paths
 
-On each direct protocol path -- inline-root replacement, code-less installation, and delegation-indicator installation -- `configuration_data` bytes beyond the 4-byte signature index form an OPTIONAL bootstrap initialization payload.
+On each protocol installation path -- an inline-root, code-less, or delegation-indicator account -- any `configuration_data` bytes form an OPTIONAL bootstrap initialization payload.
 
-A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 10 above). After the protocol validates the direct-path signature and installs the new descriptor, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor and signature index.
+A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 10 above). After the descriptor is installed, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor.
 
 The frame succeeds when the initialization code halts normally. A revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint, including the descriptor installation.
 
-The direct-path signature commits to the complete `CONFIGURE` frame through the canonical transaction hash or `CONFIGURE_HASH`, so the root authority authorizes the exact descriptor and initialization payload together; the proposed implementation still never executes before installation. This permits a code-less account, a delegated account, or an inline-root account to install a stateful verification implementation and initialize its authority state in one frame.
+The licensing signature commits to the complete `CONFIGURE` frame through the canonical transaction hash or `CONFIGURE_HASH`, so the root authority authorizes the exact descriptor and initialization payload together; the proposed implementation still never executes before installation. This permits a code-less account, a delegated account, or an inline-root account to install a stateful verification implementation and initialize its authority state in one frame.
 
 #### Applying configuration
 
 The current descriptor always determines which authority authorizes configuration. The proposed descriptor is never used before installation.
 
 ```python
-def direct_path_signature(configuration_data, tx):
-    assert len(configuration_data) >= 4
-    sig_index = int.from_bytes(configuration_data[0:4], "big")
-    assert sig_index < len(tx.signatures)
-    sig = tx.signatures[sig_index]
-    assert len(sig.msg) == 0 or sig.msg == compute_configure_hash(tx)
-    return sig
-
 def frame_in_atomic_batch(i, frames):
     return (
         frames[i].flags & ATOMIC_BATCH_FLAG
         or (i > 0 and frames[i - 1].flags & ATOMIC_BATCH_FLAG)
     )
 
+def is_protocol_install(current_descriptor, code):
+    if current_descriptor is not None:
+        return current_descriptor.authority_type == INLINE_ROOT
+    return len(code) == 0 or is_eip7702_indicator(code)
+
 def execute_structured_configure(frame, current_descriptor, tx, state):
     assert resolved_target(frame) == tx.sender
     assert frame.flags & APPROVE_SCOPE_MASK == 0
     assert frame.flags & APPROVE_CONFIGURE == 0
     assert frame.value == 0
+    assert configure_approved  # structural rule 9's runtime counterpart
 
     prepayment = payer is None
     if prepayment:
@@ -678,49 +690,34 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
 
     configuration_data = frame.data[offset + new_len:]
     checkpoint = state.checkpoint()
-    direct_path = False
 
-    if current_descriptor is None:
-        assert new_descriptor is not None
-        code = state[tx.sender].code
-        if len(code) == 0 or is_eip7702_indicator(code):
-            sig = direct_path_signature(configuration_data, tx)
-            assert sig.scheme == SECP256K1
-            assert sig.key_id == bytes32(tx.sender)  # right-aligned
-            direct_path = True
-            configuration_approved = True
-        else:
-            assert configure_approved
-            # success = normal halt (STOP or RETURN)
-            configuration_approved = execute_current_account_code(
-                mode=CONFIGURE_MODE,
-                static=False,
-                calldata=frame.data,
-            )
+    protocol_install = is_protocol_install(
+        current_descriptor, state[tx.sender].code
+    )
 
-    elif current_descriptor.authority_type == INLINE_ROOT:
+    if protocol_install:
         assert new_descriptor is not None
-        sig = direct_path_signature(configuration_data, tx)
-        assert produces_authentication_result(sig)
-        assert authorize_inline_root(
-            current_descriptor,
-            AuthenticationResult(sig.verifier, sig.key_id),
-        )
-        direct_path = True
+        if len(configuration_data) != 0:
+            # structural rule 10: bootstrap payload
+            assert authority_type_of(new_descriptor) == VERIFY_IMPLEMENTATION
         configuration_approved = True
 
-    elif current_descriptor.authority_type == VERIFY_IMPLEMENTATION:
-        assert configure_approved
+    elif current_descriptor is None:
+        # account with other code
+        # success = normal halt (STOP or RETURN)
+        configuration_approved = execute_current_account_code(
+            mode=CONFIGURE_MODE,
+            static=False,
+            calldata=frame.data,
+        )
+
+    else:  # current_descriptor.authority_type == VERIFY_IMPLEMENTATION
         # success = normal halt (STOP or RETURN)
         configuration_approved = execute_current_verification_implementation(
             mode=CONFIGURE_MODE,
             static=False,
             calldata=frame.data,
         )
-
-    if direct_path and len(configuration_data) > 4:
-        # structural rule 10
-        assert authority_type_of(new_descriptor) == VERIFY_IMPLEMENTATION
 
     if not configuration_approved:
         state.revert(checkpoint)
@@ -732,7 +729,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
         charge_descriptor_write(new_descriptor)
         state[tx.sender].code = new_descriptor
 
-    if direct_path and len(configuration_data) > 4:
+    if protocol_install and len(configuration_data) != 0:
         # success = normal halt (STOP or RETURN)
         initialized = execute_new_verification_implementation(
             mode=CONFIGURE_MODE,
@@ -754,7 +751,7 @@ The complete configuration frame is committed by the canonical transaction signa
 
 A descriptor update and authority-state update MAY occur in the same `VERIFY_IMPLEMENTATION` configuration frame.
 
-A proposed implementation never executes before installation. On the direct protocol paths, a transition to `VERIFY_IMPLEMENTATION` MAY carry a bootstrap initialization payload executed by the newly installed implementation after installation, within the same frame. Without it, a destination implementation that requires mutable authority state MUST have that state initialized before installation -- through an earlier frame, an earlier transaction, an external authority source, or a companion bootstrap profile -- or the account is locked.
+A proposed implementation never executes before installation. On the protocol installation paths, a transition to `VERIFY_IMPLEMENTATION` MAY carry a bootstrap initialization payload executed by the newly installed implementation after installation, within the same frame. Without it, a destination implementation that requires mutable authority state MUST have that state initialized before installation -- through an earlier frame, an earlier transaction, an external authority source, or a companion bootstrap profile -- or the account is locked.
 
 ### Install and first use in one transaction
 
@@ -781,13 +778,14 @@ The following flows are illustrative.
 
 Code-less account to `INLINE_ROOT`, with first use by the new root. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new root credential over the canonical transaction hash.
 
-| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                       |
-| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | ------------------------------------------ |
-| 0     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0200` descriptor, signature index 0 |
-| 1     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | signature index 1                          |
-| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                  |
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                        |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | --------------------------- |
+| 0     | VERIFY    | ENTRY_POINT | APPROVE_CONFIGURE             | Null (sender) | 0     | signature index 0           |
+| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0200` descriptor   |
+| 2     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | signature index 1           |
+| 3     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                   |
 
-Frame 0's direct protocol path checks signature 0 and installs the descriptor. Frame 1's inline root matches signature 1's `(verifier, key_id)` and approves execution and payment.
+Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account's own key and approves `APPROVE_CONFIGURE` without executing code. Frame 1 installs the descriptor through the protocol installation path. Frame 2's inline root matches signature 1's `(verifier, key_id)` and approves execution and payment with the new authentication immediately.
 
 [EIP-7702](./eip-7702.md) account to a structured account, keeping the current wallet. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new credential over the canonical transaction hash.
 
@@ -797,23 +795,25 @@ new descriptor: execution_implementation = delegation_target
                 plus the chosen authority payload
 ```
 
-| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                              |
-| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | --------------------------------- |
-| 0     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new descriptor, signature index 0 |
-| 1     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | authority-defined                 |
-| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                         |
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data              |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | ----------------- |
+| 0     | VERIFY    | ENTRY_POINT | APPROVE_CONFIGURE             | Null (sender) | 0     | signature index 0 |
+| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new descriptor    |
+| 2     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | authority-defined |
+| 3     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data         |
 
-Frame 0's direct protocol path replaces the delegation indicator, frame 1's new authority approves execution and payment, and frame 2 continues under the existing wallet logic unchanged.
+Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account key and approves `APPROVE_CONFIGURE`; the delegate code does not run. Frame 1 replaces the delegation indicator through the protocol installation path, frame 2's new authority approves execution and payment, and frame 3 continues under the existing wallet logic unchanged.
 
 Code-less account directly to a stateful `VERIFY_IMPLEMENTATION`, bootstrapping authority state in the same frame. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new credential over the canonical transaction hash.
 
-| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                                          |
-| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | ------------------------------------------------------------- |
-| 0     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0201` descriptor, signature index 0, bootstrap payload |
-| 1     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | references signature 1                                        |
-| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                                     |
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                          |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | --------------------------------------------- |
+| 0     | VERIFY    | ENTRY_POINT | APPROVE_CONFIGURE             | Null (sender) | 0     | signature index 0                             |
+| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0201` descriptor, bootstrap payload  |
+| 2     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | references signature 1                        |
+| 3     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                     |
 
-Frame 0's direct protocol path checks signature 0, installs the descriptor, and executes the bootstrap payload through the newly installed verification implementation to initialize its authority state. Frame 1's newly installed verification implementation authorizes signature 1 and approves execution and payment.
+Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account key and approves `APPROVE_CONFIGURE`. Frame 1 installs the descriptor and executes the bootstrap payload through the newly installed verification implementation to initialize its authority state. Frame 2's newly installed verification implementation authorizes signature 1 and approves execution and payment.
 
 Because both models execute implementation code with the account's address and storage as context, the existing delegation target usually carries over directly as `execution_implementation`. Address, balance, nonce sequence, storage, and application approvals are preserved; legacy ECDSA origination and further [EIP-7702](./eip-7702.md) delegation are disabled after installation. Wallet code that inspects its own account's code bytes will observe the structured descriptor rather than a delegation indicator and needs compatibility review, and the chosen verification implementation must avoid storage collisions with existing wallet state or use an external authority backend.
 
@@ -835,7 +835,7 @@ The execution implementation is intentionally independent from the authority imp
 
 [EIP-7702](./eip-7702.md) authorization processing MUST NOT overwrite structured code.
 
-Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is authorized by the account's current root-equivalent authority: the current structured descriptor's authority path; the account's own secp256k1 key for a code-less account or an [EIP-7702](./eip-7702.md) delegation indicator; or the account's own validation code approving the `APPROVE_CONFIGURE` scope. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
+Descriptor installation through `CONFIGURE` MAY replace empty code, an [EIP-7702](./eip-7702.md) delegation indicator, or existing contract code. In every case the replacement is licensed by the account's current root-equivalent authority approving `APPROVE_CONFIGURE` from a `VERIFY` frame: through the current structured descriptor's authority path, through protocol root licensing of the account's own secp256k1 key for a code-less account or an [EIP-7702](./eip-7702.md) delegation indicator, or through the account's own validation code. The prior code, including a delegation indicator, is permanently discarded and is not recoverable from the descriptor.
 
 [EIP-8298](./eip-8298.md) `SETCODEFROM` MUST fail when the current execution-context account is structured, and a structured descriptor MUST NOT be a valid [EIP-8298](./eip-8298.md) source. Otherwise ordinary execution code could replace the authority descriptor outside `CONFIGURE`.
 
@@ -852,6 +852,8 @@ STRUCTURED_VERIFY_BASE_GAS
 + resolved-target account access
 + referenced signature validation cost
 ```
+
+A root-licensing `VERIFY` frame on a code-less or delegation-indicator account charges identically.
 
 Verification-implementation authorization uses the frame's ordinary [EIP-8141](./eip-8141.md) execution-gas budget. Resolving `verification_implementation` charges the applicable [EIP-2929](./eip-2929.md) warm or cold account/code access cost analogously to [EIP-7702](./eip-7702.md) code resolution. Calls and storage reads made by verification code are charged through normal EVM rules.
 
@@ -874,19 +876,19 @@ A `CONFIGURE` frame occurring while `payer == None` is part of the [EIP-8141](./
 Public-mempool implementations MUST recognize the forms:
 
 ```text
-[pre_configure, self_verify]
-[pre_configure, only_verify, pay]
+[root_license, pre_configure, self_verify]
+[root_license, pre_configure, only_verify, pay]
 ```
 
-when `pre_configure` is directly evaluable: an inline-root descriptor replacement, a code-less-account installation, or an [EIP-7702](./eip-7702.md)-indicator installation, each carrying no bootstrap initialization payload, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation or existing account code remains profile-dependent (see below); such forms include the licensing configure-approving `VERIFY` frame, for example `[configure_verify, pre_configure, self_verify]`.
+when `root_license` is a protocol root-licensing `VERIFY` frame (an inline-root, code-less, or delegation-indicator sender) and `pre_configure` is a protocol installation carrying no bootstrap initialization payload, alongside the existing optional expiry/deploy variants. Neither frame executes EVM code. Recognition of forms whose licensing `VERIFY` or configuration executes a verification implementation or existing account code remains profile-dependent (see below).
 
 A pre-payment configuration is evaluated on a temporary state overlay. Every later validation frame observes that overlay. The overlay is discarded if the transaction is rejected, replaced, evicted, becomes invalid, or fails to establish a payer.
 
 #### Directly evaluable pre-configuration
 
-An inline-root descriptor replacement, a code-less-account installation, and an [EIP-7702](./eip-7702.md)-indicator installation whose `configuration_data` carries no bootstrap initialization payload are directly evaluable without executing EVM code. Their dependencies are the current account code (descriptor, emptiness, or delegation indicator), the referenced signature result, the proposed descriptor, and the later validation-prefix dependencies.
+A protocol root-licensing `VERIFY` frame, and a protocol installation whose `configuration_data` carries no bootstrap initialization payload, are directly evaluable without executing EVM code. Their dependencies are the current account code (descriptor, emptiness, or delegation indicator), the referenced signature result, the proposed descriptor, and the later validation-prefix dependencies.
 
-An init-bearing direct installation executes the newly installed verification implementation and follows the verification-implementation pre-configuration rules below; the executed code hash is determined statically by the frame payload.
+An init-bearing protocol installation executes the newly installed verification implementation and follows the verification-implementation pre-configuration rules below; the executed code hash is determined statically by the frame payload.
 
 #### Verification-implementation pre-configuration
 
@@ -961,7 +963,7 @@ A simple account should not pay an external call and storage lookup merely to re
 
 ### Why configuration authorization lives in `VERIFY`
 
-Authorization grammar in [EIP-8141](./eip-8141.md) is the `APPROVE` scope approved from validation frames. Expressing configuration authority as an additional scope bit keeps one authorization channel, lets a single verification pass approve execution, payment, and configuration together over one credential, and keeps every authorization decision inside statically analyzable `VERIFY` frames or direct protocol paths. The `CONFIGURE` frame is thereby a licensed, non-static mutation frame with no authority of its own -- which also lets it compose with atomic batches and multi-operation configuration payloads.
+Authorization grammar in [EIP-8141](./eip-8141.md) is the `APPROVE` scope approved from validation frames. Expressing configuration authority as an additional scope bit keeps one authorization channel, lets a single verification pass approve execution, payment, and configuration together over one credential, and keeps every authorization decision inside statically analyzable `VERIFY` frames -- account code where the account has authority code, protocol root licensing where it does not. The `CONFIGURE` frame is thereby a licensed, non-static mutation frame with no authority of its own -- which also lets it compose with atomic batches and multi-operation configuration payloads.
 
 The scope bit is excluded from `APPROVE_SCOPE_MASK`, so a wallet that approves execution for a restricted credential never implicitly grants configuration; the verification implementation decides per credential which scopes to approve.
 
@@ -977,9 +979,13 @@ The DoS concern is addressed by validation gas/state bounds and recognized profi
 
 `SENDER` frames begin the account's ordinary business execution under its established authority. Ordering every configuration ahead of them keeps a transaction's authority phase-coherent: authority is authenticated, licensed, and mutated first, and execution then runs under the resulting authority -- mirroring the existing rule that account authority is established before any `SENDER` frame. It also keeps authority mutation out of reach of business-execution outcomes: a configuration conditioned on the results of the account's own execution re-couples authority to wallet logic, and offers nothing a subsequent transaction cannot. Other frame modes may precede a post-payment `CONFIGURE` because validation and payment frames establish the transaction's authority and payment context rather than acting under it.
 
-### Why direct installation may execute the destination implementation
+### Why every configuration is licensed from a `VERIFY` frame
 
-The direct-path license is a root-equivalent signature over the canonical transaction hash or `CONFIGURE_HASH`, either of which commits to the complete `CONFIGURE` frame -- the exact new descriptor and initialization payload included. Executing the newly installed implementation after installation therefore runs only code and data the root authority explicitly authorized, and it removes the bootstrap-lockout gap for accounts whose current authority has no code to perform the initialization: code-less accounts, delegated accounts, and inline roots.
+An earlier draft exempted protocol-checked installation paths from the licensing rule, validating the root signature inside the `CONFIGURE` frame itself. That produced two authorization grammars. The rule is now uniform: authorization happens only in `VERIFY` frames -- through account code where the account has authority code, and through protocol-native root verification where it does not -- and `CONFIGURE` is purely a licensed mutation frame with no authorization logic of any form. Uniformity changes nothing about the enable-mode construction: license under the current authentication, mutate, and use the new authentication in the very next validation frame. Because root licensing is protocol-defined, it adds no EVM execution and preserves the static evaluability the old exempt paths existed for.
+
+### Why protocol installation may execute the destination implementation
+
+The licensing root signature -- over the canonical transaction hash or `CONFIGURE_HASH` -- commits to the complete `CONFIGURE` frame: the exact new descriptor and initialization payload included. Executing the newly installed implementation after installation therefore runs only code and data the root authority explicitly authorized, and it removes the bootstrap-lockout gap for accounts whose current authority has no code to perform the initialization: code-less accounts, delegated accounts, and inline roots.
 
 The payload is optional so the payload-free installation paths remain directly evaluable without EVM execution. An init-bearing installation is priced and mempool-gated like any other verification-implementation configuration.
 
@@ -1028,7 +1034,7 @@ The descriptor stores an address rather than an expected runtime code hash. An i
 
 #### Bootstrap into stateful verification
 
-The direct installation paths can bootstrap the destination implementation through an initialization payload, and a `VERIFY_IMPLEMENTATION` source can initialize the destination through its own configuration code. What remains open is standardization: a canonical initialization calldata convention, and mempool profiles admitting init-bearing pre-payment installations. Installing a stateful implementation without initialization and without pre-existing authority state still locks the account.
+The protocol installation paths can bootstrap the destination implementation through an initialization payload, and a `VERIFY_IMPLEMENTATION` source can initialize the destination through its own configuration code. What remains open is standardization: a canonical initialization calldata convention, and mempool profiles admitting init-bearing pre-payment installations. Installing a stateful implementation without initialization and without pre-existing authority state still locks the account.
 
 #### Existing non-frame accounts
 
@@ -1073,7 +1079,7 @@ Implementations MUST cover at least the following cases.
 1. Accept a matching `(verifier, key_id)` and requested approval scope.
 2. Reject the same key ID under another verifier.
 3. Reject `ARBITRARY` as an inline-root credential.
-4. Reject an inline-root `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit.
+4. Approve `APPROVE_CONFIGURE` from an inline-root `VERIFY` frame; a `CONFIGURE_HASH` signature licenses only that scope, and combining it with execution/payment flags is invalid.
 
 ### Verification context
 
@@ -1092,7 +1098,7 @@ Implementations MUST cover at least the following cases.
 1. `CONFIGURE_HASH` differs across chain IDs, senders, nonces, `CONFIGURE` frame positions, and any descriptor or configuration-payload change.
 2. `CONFIGURE_HASH` is unchanged when only fees or unrelated frames change.
 3. `TXPARAM(0x0D)` halts when the transaction has no `CONFIGURE` frame.
-4. A `CONFIGURE_HASH` signature licenses configuration on each direct protocol path and cannot approve execution or payment.
+4. A `CONFIGURE_HASH` signature licenses a configure-only root-licensing `VERIFY` frame on inline-root, code-less, and delegation-indicator accounts, and cannot approve execution or payment.
 5. A canonical transaction signature may authorize configuration combined with execution/payment scopes.
 
 ### `APPROVE_CONFIGURE`
@@ -1102,10 +1108,11 @@ Implementations MUST cover at least the following cases.
 3. Reject any `APPROVE` inside a `CONFIGURE` frame.
 4. Reject a second `APPROVE_CONFIGURE` when `configure_approved` is already set.
 5. Confirm approving `APPROVE_CONFIGURE` does not alter `sender_approved`, payer, nonce, or maximum-cost collection.
-6. Reject a `CONFIGURE` frame executing current-authority code with no preceding configure-approving `VERIFY` frame.
+6. Reject any `CONFIGURE` frame with no preceding configure-approving `VERIFY` frame, on every path including protocol installation.
 7. Confirm a licensed `CONFIGURE` frame succeeds on normal halt, and rolls back all configuration state changes on revert or exceptional halt.
 8. Reject a pre-payment configuration that carries `ATOMIC_BATCH_FLAG` or terminates an atomic batch begun by its predecessor.
 9. Roll back `configure_approved` when a combined `APPROVE` fails its payment effects, when the approving frame reverts, and when an atomic batch unrolls.
+10. Approve `APPROVE_CONFIGURE` through a root-licensing `VERIFY` frame on a code-less and on a delegation-indicator account; reject a non-account-key signature; confirm neither default nor delegate code executes.
 
 ### Pre-payment configuration
 
@@ -1126,15 +1133,15 @@ Implementations MUST cover at least the following cases.
 
 ### Installation
 
-1. Install a descriptor on a code-less account with the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`.
-2. Install over an [EIP-7702](./eip-7702.md) delegation indicator with the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`.
-3. Reject direct installation on an account with contract code; require a configure approval from that account's own `VERIFY` frame.
+1. Install a descriptor on a code-less account through a root-licensing `VERIFY` frame referencing the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`.
+2. Install over an [EIP-7702](./eip-7702.md) delegation indicator through a root-licensing `VERIFY` frame referencing the account's own secp256k1 signature over the canonical hash or `CONFIGURE_HASH`; reject any other signer, scheme, or `msg`; confirm the delegate code does not execute in the licensing frame.
+3. Reject a root-licensing `VERIFY` frame targeting an account with contract code; require a configure approval from that account's own `VERIFY` frame.
 4. Reject installation on a smart account whose transaction was execution-approved by a restricted credential and whose code does not approve configuration.
 5. Migrate a code-less account and approve execution and payment with the new root in the same transaction; a failed new-root `VERIFY` reverts the installation.
 6. Migrate an [EIP-7702](./eip-7702.md) account reusing the delegation target as `execution_implementation`; storage and balance are unchanged, and both legacy origination and new delegation are rejected afterward.
 7. Install a stateful verification implementation on a code-less account with a bootstrap payload, initialize its authority state, and approve execution and payment with a newly installed credential in the same transaction.
 8. Revert during bootstrap initialization and confirm the descriptor installation and all state changes roll back to the frame-entry checkpoint.
-9. Reject a bootstrap payload combined with an `INLINE_ROOT` descriptor on every direct path.
+9. Reject a bootstrap payload combined with an `INLINE_ROOT` descriptor on every protocol installation path.
 
 ### Descriptor configuration
 
@@ -1149,12 +1156,12 @@ Implementations MUST cover at least the following cases.
 
 ### Public mempool
 
-1. Admit directly evaluable pre-configuration: inline-root replacement, code-less installation, and delegation-indicator installation.
+1. Admit the directly evaluable forms: a root-licensing `VERIFY` frame plus protocol installation, for inline-root replacement, code-less installation, and delegation-indicator installation.
 2. Reject unrecognized state-changing pre-payment verification implementations from generic propagation.
 3. Admit a recognized profile with bounded reads, writes, calls, and gas.
 4. Change a declared dependency and revalidate the transaction and temporary overlay.
 5. Directly evaluate a profile and reproduce EVM gas, state, returndata, failure, and approval behavior.
-6. Treat an init-bearing direct installation as profile-dependent rather than directly evaluable.
+6. Treat an init-bearing protocol installation as profile-dependent rather than directly evaluable.
 
 ### Code replacement
 
@@ -1208,11 +1215,11 @@ A pre-payment configuration is provisional through later validation and payer se
 
 ### Bootstrap lockout
 
-Installing a stateful verification implementation without initialized authority state may permanently lock the account. Wallets MUST initialize destination authority state through the direct-path bootstrap payload, a prior initialization step, or a pre-initialized external authority. Bootstrap initialization code is full authority code: the direct-path signature commits to the exact descriptor and payload, and a buggy initialization can install unusable or unintended authority state before halting.
+Installing a stateful verification implementation without initialized authority state may permanently lock the account. Wallets MUST initialize destination authority state through the bootstrap payload, a prior initialization step, or a pre-initialized external authority. Bootstrap initialization code is full authority code: the licensing signature commits to the exact descriptor and payload, and a buggy initialization can install unusable or unintended authority state before halting.
 
 ### Execution approval is not configuration authority
 
-[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority would let such a credential replace the account's code and seize root authority. No installation or configuration path therefore consults `sender_approved`: direct protocol paths verify a root-equivalent signature themselves, and every other path requires the separate `configure_approved` value, which only a `VERIFY`-frame `APPROVE` in the account's own context can establish.
+[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority would let such a credential replace the account's code and seize root authority. No installation or configuration path therefore consults `sender_approved`: every path requires the separate `configure_approved` value, established only from a `VERIFY` frame -- by account code approving in the account's own context, or by protocol root licensing verifying a root-equivalent signature.
 
 The same rule applies inside verification implementations. Code deciding whether to approve `APPROVE_CONFIGURE` MUST derive that decision from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority. It MUST bind the approval to the exact `CONFIGURE` frame payload, which it can read through frame introspection before approving.
 
