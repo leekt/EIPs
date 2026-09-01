@@ -760,27 +760,16 @@ A proposed implementation never executes before installation. On the direct prot
 
 A pre-payment `CONFIGURE` frame may install a new authorization entry that authorizes a later `VERIFY` frame in the same transaction.
 
-```text
-signatures[0] = current administrator signs canonical transaction hash
-signatures[1] = new credential holder signs canonical transaction hash
+Signature 0 is the current administrator over the canonical transaction hash; signature 1 is the new credential holder over the canonical transaction hash.
 
-frame 0: VERIFY
-    current verification implementation authenticates signatures[0]
-    inspects the CONFIGURE frame payload via frame introspection
-    APPROVE(APPROVE_CONFIGURE)
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                                                    |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | ----------------------------------------------------------------------- |
+| 0     | VERIFY    | ENTRY_POINT | APPROVE_CONFIGURE             | Null (sender) | 0     | references signature 0                                                  |
+| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | `0x0000`, authorization payload for signature 1's `(verifier, key_id)` |
+| 2     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | references signature 1                                                  |
+| 3     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                                               |
 
-frame 1: CONFIGURE
-    current verification implementation installs authorization
-    for signatures[1].(verifier, key_id) and halts normally
-
-frame 2: VERIFY
-    current verification implementation reads signatures[1]
-    observes the authorization installed by frame 1
-    APPROVE_EXECUTION_AND_PAYMENT
-
-frame 3: SENDER
-    ordinary execution
-```
+Frame 0's verification implementation authenticates signature 0, inspects the `CONFIGURE` frame payload through frame introspection, and calls `APPROVE(APPROVE_CONFIGURE)`. Frame 1's verification implementation installs authorization for signature 1's `(verifier, key_id)` and halts normally. Frame 2's verification implementation reads signature 1, observes the authorization installed by frame 1, and approves execution and payment.
 
 [EIP-8141](./eip-8141.md) authenticates both protocol-validated signatures before frame execution. This does not authorize the new credential early; it only establishes the credential identity. The ordered `CONFIGURE` frame creates authorization before the later `VERIFY` consumes it.
 
@@ -790,58 +779,41 @@ If any of frames 0 through 2 fails, no payer is established, or another validati
 
 The following flows are illustrative.
 
-Code-less account to `INLINE_ROOT`, with first use by the new root:
+Code-less account to `INLINE_ROOT`, with first use by the new root. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new root credential over the canonical transaction hash.
 
-```text
-signatures[0] = account key signs compute_configure_hash(tx)
-signatures[1] = new root credential signs canonical transaction hash
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                       |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | ------------------------------------------ |
+| 0     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0200` descriptor, signature index 0 |
+| 1     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | signature index 1                          |
+| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                  |
 
-frame 0: CONFIGURE
-    direct protocol path checks signatures[0]
-    installs the 0xef0200 descriptor
+Frame 0's direct protocol path checks signature 0 and installs the descriptor. Frame 1's inline root matches signature 1's `(verifier, key_id)` and approves execution and payment.
 
-frame 1: VERIFY
-    inline root matches signatures[1].(verifier, key_id)
-    APPROVE_EXECUTION_AND_PAYMENT
-
-frame 2: SENDER
-    ordinary execution
-```
-
-[EIP-7702](./eip-7702.md) account to a structured account, keeping the current wallet:
+[EIP-7702](./eip-7702.md) account to a structured account, keeping the current wallet. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new credential over the canonical transaction hash.
 
 ```text
 current code:   0xef0100 || delegation_target
 new descriptor: execution_implementation = delegation_target
                 plus the chosen authority payload
-
-signatures[0] = account key signs compute_configure_hash(tx)
-signatures[1] = new credential signs canonical transaction hash
-
-frame 0: CONFIGURE   direct protocol path replaces the indicator
-frame 1: VERIFY      new authority approves execution and payment
-frame 2: SENDER      existing wallet logic continues unchanged
 ```
 
-Code-less account directly to a stateful `VERIFY_IMPLEMENTATION`, bootstrapping authority state in the same frame:
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                              |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | --------------------------------- |
+| 0     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new descriptor, signature index 0 |
+| 1     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | authority-defined                 |
+| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                         |
 
-```text
-signatures[0] = account key signs compute_configure_hash(tx)
-signatures[1] = new credential signs canonical transaction hash
+Frame 0's direct protocol path replaces the delegation indicator, frame 1's new authority approves execution and payment, and frame 2 continues under the existing wallet logic unchanged.
 
-frame 0: CONFIGURE
-    direct protocol path checks signatures[0]
-    installs the 0xef0201 descriptor
-    newly installed verification implementation executes the
-    bootstrap payload and initializes its authority state
+Code-less account directly to a stateful `VERIFY_IMPLEMENTATION`, bootstrapping authority state in the same frame. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new credential over the canonical transaction hash.
 
-frame 1: VERIFY
-    new verification implementation authorizes signatures[1]
-    APPROVE_EXECUTION_AND_PAYMENT
+| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                                          |
+| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | ------------------------------------------------------------- |
+| 0     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0201` descriptor, signature index 0, bootstrap payload |
+| 1     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | references signature 1                                        |
+| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                                     |
 
-frame 2: SENDER
-    ordinary execution
-```
+Frame 0's direct protocol path checks signature 0, installs the descriptor, and executes the bootstrap payload through the newly installed verification implementation to initialize its authority state. Frame 1's newly installed verification implementation authorizes signature 1 and approves execution and payment.
 
 Because both models execute implementation code with the account's address and storage as context, the existing delegation target usually carries over directly as `execution_implementation`. Address, balance, nonce sequence, storage, and application approvals are preserved; legacy ECDSA origination and further [EIP-7702](./eip-7702.md) delegation are disabled after installation. Wallet code that inspects its own account's code bytes will observe the structured descriptor rather than a delegation indicator and needs compatibility review, and the chosen verification implementation must avoid storage collisions with existing wallet state or use an external authority backend.
 
