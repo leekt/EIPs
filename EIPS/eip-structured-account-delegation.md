@@ -427,15 +427,15 @@ No verification or execution implementation bytecode runs. The inline root is fu
 
 [EIP-8141](./eip-8141.md)'s default code natively approves execution and payment scopes for code-less accounts. This proposal extends protocol-native verification to the configure scope. A `VERIFY` frame is a **root-licensing frame** when it targets `tx.sender`, carries the `APPROVE_CONFIGURE` flag bit, and the account is code-less or carries an [EIP-7702](./eip-7702.md) delegation indicator. It succeeds only when:
 
-1. The requested scope is exactly `APPROVE_CONFIGURE`: `frame.flags & EXTENDED_APPROVE_SCOPE_MASK == APPROVE_CONFIGURE`.
-2. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`, containing one unsigned 32-bit big-endian signature index.
-3. The referenced signature is `SECP256K1` and its recovered address equals `tx.sender`.
-4. The signature's `msg` is empty or equals `compute_configure_hash(tx)`.
-5. Every ordinary [EIP-8141](./eip-8141.md) structural rule holds.
+1. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`, containing one unsigned 32-bit big-endian signature index.
+2. The referenced signature is `SECP256K1` and its recovered address equals `tx.sender`.
+3. The signature's `msg` is empty, or equals `compute_configure_hash(tx)` when the requested scope is exactly `APPROVE_CONFIGURE`.
+4. On a delegation-indicator account, the requested scope is exactly `APPROVE_CONFIGURE`.
+5. Every ordinary [EIP-8141](./eip-8141.md) structural rule for the requested scope holds.
 
-On success, protocol applies the same effects as `APPROVE(APPROVE_CONFIGURE)`. No default code, delegated code, or implementation bytecode runs.
+On success, protocol applies the same effects as `APPROVE(frame.flags & EXTENDED_APPROVE_SCOPE_MASK)`. No default code, delegated code, or implementation bytecode runs.
 
-The root-licensing path approves configuration and nothing else. Execution and payment on these accounts continue to flow exclusively through existing [EIP-8141](./eip-8141.md) dispatch -- the default code for a code-less account, the delegate for a delegated account -- so the root path never bypasses the delegate's validation policy. For a delegation-indicator account the configure-only bypass is deliberate: the account key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, and existing delegates predate the configure scope. A `VERIFY` frame without the configure bit is unaffected and follows existing [EIP-8141](./eip-8141.md) dispatch, including delegate execution.
+On a code-less account a canonical-hash signature MAY combine the configure scope with execution and payment: the account key already approves those through [EIP-8141](./eip-8141.md)'s default code, so there is no separate validation policy to bypass, and the combined frame is equivalent to the default-code approval plus configure licensing in one step. On a delegation-indicator account the root path is configure-only: execution and payment continue to flow exclusively through the delegate, so the root path never bypasses the delegate's validation policy. That configure-only bypass is deliberate: the account key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, and existing delegates predate the configure scope. A `VERIFY` frame without the configure bit is unaffected and follows existing [EIP-8141](./eip-8141.md) dispatch, including delegate execution.
 
 ### Canonical configuration hash
 
@@ -562,7 +562,7 @@ CONFIGURE mutates authentication state or the descriptor.
 Every later VERIFY observes the post-configuration authority.
 ```
 
-The licensing `VERIFY` frame MAY be the same frame that approves execution and payment -- one `APPROVE` with combined scope -- or a configure-only `VERIFY` frame, before or after payer approval. A root-licensing frame on a code-less or delegated account is always configure-only. The same canonical-hash signature entry may support the licensing frame and any other frame: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the modes duplicates no witness and repeats no cryptographic verification. Later validation frames observe the configuration's effects, so a pre-payment licensing `VERIFY` plus `CONFIGURE` ahead of the remaining validation frames is the install-and-first-use construction.
+The licensing `VERIFY` frame MAY be the same frame that approves execution and payment -- one `APPROVE` with combined scope -- or a configure-only `VERIFY` frame, before or after payer approval. A root-licensing frame on a delegated account is always configure-only; on a code-less account it may combine scopes under a canonical-hash signature. The same canonical-hash signature entry may support the licensing frame and any other frame: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the modes duplicates no witness and repeats no cryptographic verification. Later validation frames observe the configuration's effects, so a pre-payment licensing `VERIFY` plus `CONFIGURE` ahead of the remaining validation frames is the install-and-first-use construction.
 
 A `CONFIGURE` frame never authorizes itself and never inherits authority from `sender_approved` or `payer` state; only `configure_approved` licenses it.
 
@@ -783,18 +783,17 @@ If any of frames 0 through 2 fails, no payer is established, or another validati
 
 ### Migration examples
 
-The following flows are illustrative.
+The following flows are illustrative. The migration itself needs only a configure-approving `VERIFY`; exercising the new authority in the same transaction -- the install-and-first-use construction above -- is a wallet choice, not a protocol requirement.
 
-Code-less account to `INLINE_ROOT`, with first use by the new root. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new root credential over the canonical transaction hash.
+Code-less account to `INLINE_ROOT`. Signature 0 is the account key over the canonical transaction hash.
 
-| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                        |
-| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | --------------------------- |
-| 0     | VERIFY    | ENTRY_POINT | APPROVE_CONFIGURE             | Null (sender) | 0     | signature index 0           |
-| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0200` descriptor   |
-| 2     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | signature index 1           |
-| 3     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                   |
+| Frame | Mode      | Caller      | Flags                                       | Target        | Value | Data                      |
+| ----- | --------- | ----------- | ------------------------------------------- | ------------- | ----- | ------------------------- |
+| 0     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT_AND_CONFIGURE | Null (sender) | 0     | signature index 0         |
+| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE                          | Null (sender) | 0     | new `0xef0200` descriptor |
+| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE                          | Target        | 0     | Call data                 |
 
-Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account's own key and approves `APPROVE_CONFIGURE` without executing code. Frame 1 installs the descriptor through the protocol installation path. Frame 2's inline root matches signature 1's `(verifier, key_id)` and approves execution and payment with the new authentication immediately.
+Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account's own key and approves execution, payment, and configuration in one `APPROVE` without executing code. Frame 1 installs the descriptor through the protocol installation path; every later frame observes the new authority. Exercising the new root in the same transaction instead uses the install-and-first-use shape: a configure-only frame 0 over `compute_configure_hash(tx)` and a post-`CONFIGURE` `VERIFY` referencing a new-root signature.
 
 [EIP-7702](./eip-7702.md) account to a structured account, keeping the current wallet. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new credential over the canonical transaction hash.
 
@@ -813,16 +812,15 @@ new descriptor: execution_implementation = delegation_target
 
 Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account key and approves `APPROVE_CONFIGURE`; the delegate code does not run. Frame 1 replaces the delegation indicator through the protocol installation path, frame 2's new authority approves execution and payment, and frame 3 continues under the existing wallet logic unchanged.
 
-Code-less account directly to a stateful `VERIFY_IMPLEMENTATION`, bootstrapping authority state in the same frame. Signature 0 is the account key over `compute_configure_hash(tx)`; signature 1 is the new credential over the canonical transaction hash.
+Code-less account directly to a stateful `VERIFY_IMPLEMENTATION`, bootstrapping authority state in the same frame. Signature 0 is the account key over the canonical transaction hash.
 
-| Frame | Mode      | Caller      | Flags                         | Target        | Value | Data                                          |
-| ----- | --------- | ----------- | ----------------------------- | ------------- | ----- | --------------------------------------------- |
-| 0     | VERIFY    | ENTRY_POINT | APPROVE_CONFIGURE             | Null (sender) | 0     | signature index 0                             |
-| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE            | Null (sender) | 0     | new `0xef0201` descriptor, bootstrap payload  |
-| 2     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT | Null (sender) | 0     | references signature 1                        |
-| 3     | SENDER    | Sender      | APPROVE_SCOPE_NONE            | Target        | 0     | Call data                                     |
+| Frame | Mode      | Caller      | Flags                                       | Target        | Value | Data                                         |
+| ----- | --------- | ----------- | ------------------------------------------- | ------------- | ----- | -------------------------------------------- |
+| 0     | VERIFY    | ENTRY_POINT | APPROVE_EXECUTION_AND_PAYMENT_AND_CONFIGURE | Null (sender) | 0     | signature index 0                            |
+| 1     | CONFIGURE | ENTRY_POINT | APPROVE_SCOPE_NONE                          | Null (sender) | 0     | new `0xef0201` descriptor, bootstrap payload |
+| 2     | SENDER    | Sender      | APPROVE_SCOPE_NONE                          | Target        | 0     | Call data                                    |
 
-Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account key and approves `APPROVE_CONFIGURE`. Frame 1 installs the descriptor and executes the bootstrap payload through the newly installed verification implementation to initialize its authority state. Frame 2's newly installed verification implementation authorizes signature 1 and approves execution and payment.
+Frame 0 is a root-licensing frame: the protocol checks signature 0 against the account key and approves execution, payment, and configuration in one `APPROVE`. Frame 1 installs the descriptor and executes the bootstrap payload through the newly installed verification implementation to initialize its authority state. Appending a post-`CONFIGURE` `VERIFY` referencing a new-credential signature exercises the installed authority in the same transaction.
 
 Because both models execute implementation code with the account's address and storage as context, the existing delegation target usually carries over directly as `execution_implementation`. Address, balance, nonce sequence, storage, and application approvals are preserved; legacy ECDSA origination and further [EIP-7702](./eip-7702.md) delegation are disabled after installation. Wallet code that inspects its own account's code bytes will observe the structured descriptor rather than a delegation indicator and needs compatibility review, and the chosen verification implementation must avoid storage collisions with existing wallet state or use an external authority backend.
 
@@ -1121,8 +1119,9 @@ Implementations MUST cover at least the following cases.
 7. Confirm a licensed `CONFIGURE` frame succeeds on normal halt, and rolls back all configuration state changes on revert or exceptional halt.
 8. Reject a pre-payment configuration that carries `ATOMIC_BATCH_FLAG` or terminates an atomic batch begun by its predecessor.
 9. Roll back `configure_approved` when a combined `APPROVE` fails its payment effects, when the approving frame reverts, and when an atomic batch unrolls.
-10. Approve `APPROVE_CONFIGURE` through a root-licensing `VERIFY` frame on a code-less and on a delegation-indicator account; reject a non-account-key signature; reject a root-licensing frame requesting execution or payment scope; confirm neither default nor delegate code executes.
-11. Confirm `CONFIGURE` frame entry consumes `configure_approved`, and a rolled-back `CONFIGURE` frame restores it with the approval context.
+10. Approve `APPROVE_CONFIGURE` through a root-licensing `VERIFY` frame on a code-less and on a delegation-indicator account; reject a non-account-key signature; confirm neither default nor delegate code executes.
+11. Approve combined execution, payment, and configure scope through a code-less root-licensing frame under a canonical-hash signature; reject the combined scope on a delegation-indicator account and under a `CONFIGURE_HASH` signature.
+12. Confirm `CONFIGURE` frame entry consumes `configure_approved`, and a rolled-back `CONFIGURE` frame restores it with the approval context.
 
 ### Pre-payment configuration
 
