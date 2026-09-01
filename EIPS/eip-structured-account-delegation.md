@@ -1001,6 +1001,10 @@ It was unnecessarily restrictive. [EIP-8141](./eip-8141.md) authenticates signat
 
 The DoS concern is addressed by validation gas/state bounds and recognized profiles, not by prohibiting the ordering entirely.
 
+### Why no `SENDER` frame precedes `CONFIGURE`
+
+`SENDER` frames begin the account's ordinary business execution under its established authority. Ordering every configuration ahead of them keeps a transaction's authority phase-coherent: authority is authenticated, licensed, and mutated first, and execution then runs under the resulting authority -- mirroring the existing rule that account authority is established before any `SENDER` frame. It also keeps authority mutation out of reach of business-execution outcomes: a configuration conditioned on the results of the account's own execution re-couples authority to wallet logic, and offers nothing a subsequent transaction cannot. Other frame modes may precede a post-payment `CONFIGURE` because validation and payment frames establish the transaction's authority and payment context rather than acting under it.
+
 ### Why direct installation may execute the destination implementation
 
 The direct-path license is a root-equivalent signature over the canonical transaction hash or `CONFIGURE_HASH`, either of which commits to the complete `CONFIGURE` frame -- the exact new descriptor and initialization payload included. Executing the newly installed implementation after installation therefore runs only code and data the root authority explicitly authorized, and it removes the bootstrap-lockout gap for accounts whose current authority has no code to perform the initialization: code-less accounts, delegated accounts, and inline roots.
@@ -1169,6 +1173,7 @@ Implementations MUST cover at least the following cases.
 5. Confirm the current, not proposed, authority authorizes replacement.
 6. Reject descriptor-write out-of-gas and revert all configuration effects.
 7. Charge the full descriptor length on a same-length root rotation.
+8. Replace an inline root with a stateful `VERIFY_IMPLEMENTATION` descriptor carrying a bootstrap payload; the newly installed implementation initializes its authority state and a later `VERIFY` frame authorizes with a newly installed credential; a bootstrap revert rolls back the replacement.
 
 ### Public mempool
 
