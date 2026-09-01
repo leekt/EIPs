@@ -144,7 +144,7 @@ The initial normalization rules are:
 | Signature scheme | `verifier` | `key_id` |
 |---|---|---|
 | [EIP-8141](./eip-8141.md) `SECP256K1` | `ECRECOVER_VERIFIER` | recovered address right-aligned in 32 bytes |
-| [EIP-8141](./eip-8141.md) `P256` | `P256_VERIFIER` | `keccak256(qx || qy)` |
+| [EIP-8141](./eip-8141.md) `P256` | `P256_VERIFIER` | `keccak256(qx \|\| qy)` |
 
 A future EIP defining an additional protocol-validated signature scheme MAY extend this table by specifying how the scheme derives its `AuthenticationResult` from the verified witness.
 
@@ -531,7 +531,7 @@ assert frame.flags < 16
 |---|---|---|
 | `0-1` | execution/payment approval scope | existing [EIP-8141](./eip-8141.md) rules |
 | `2` | `ATOMIC_BATCH_FLAG` | `DEFAULT`, `SENDER`, and post-payment `CONFIGURE` frames |
-| `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` |
+| `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` and does not resolve to an `INLINE_ROOT` account |
 | `4+` | reserved | no frame |
 
 A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 8 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
@@ -558,13 +558,14 @@ The frame is structurally valid only when:
 
 1. `resolved_target == tx.sender`.
 2. `frame.flags & APPROVE_SCOPE_MASK == 0`.
-3. no undefined flag bit is set.
+3. no flag bit that the flag-validity table does not permit for the frame's mode is set.
 4. `frame.value == 0`.
 5. a nonzero `new_descriptor_length` fits within `frame.data` and the selected bytes parse under an active authority type.
 6. at most one `CONFIGURE` frame appears in the transaction.
 7. no `SENDER` frame precedes it.
 8. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
 9. unless the frame resolves to a direct protocol path, an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
+10. if the frame resolves to a direct protocol path, `configuration_data` bytes beyond the 4-byte signature index are present only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
 
 At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame.
 
@@ -629,7 +630,7 @@ If `tx.sender` is not yet structured, the installation path depends on the accou
 
 On each direct protocol path -- inline-root replacement, code-less installation, and delegation-indicator installation -- `configuration_data` bytes beyond the 4-byte signature index form an OPTIONAL bootstrap initialization payload.
 
-A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor it is a configuration failure. After the protocol validates the direct-path signature and installs the new descriptor, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor and signature index.
+A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 10 above). After the protocol validates the direct-path signature and installs the new descriptor, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor and signature index.
 
 The frame succeeds when the initialization code halts normally. A revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint, including the descriptor installation.
 
@@ -657,6 +658,7 @@ def frame_in_atomic_batch(i, frames):
 def execute_structured_configure(frame, current_descriptor, tx, state):
     assert resolved_target(frame) == tx.sender
     assert frame.flags & APPROVE_SCOPE_MASK == 0
+    assert frame.flags & APPROVE_CONFIGURE == 0
     assert frame.value == 0
 
     prepayment = payer is None
@@ -665,15 +667,16 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
 
     charge_execution_gas(frame, CONFIGURE_BASE_GAS)
 
-    new_len = int.from_bytes(frame.data[0:2], "big")
-    assert 2 + new_len <= len(frame.data)
+    new_len = int.from_bytes(frame.data[0:CONFIGURE_LENGTH_BYTES], "big")
+    offset = CONFIGURE_LENGTH_BYTES
+    assert offset + new_len <= len(frame.data)
 
     new_descriptor = None
     if new_len != 0:
-        new_descriptor = frame.data[2:2 + new_len]
+        new_descriptor = frame.data[offset:offset + new_len]
         parse_structured_account(new_descriptor)
 
-    configuration_data = frame.data[2 + new_len:]
+    configuration_data = frame.data[offset + new_len:]
     checkpoint = state.checkpoint()
     direct_path = False
 
@@ -715,6 +718,10 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
             calldata=frame.data,
         )
 
+    if direct_path and len(configuration_data) > 4:
+        # structural rule 10
+        assert authority_type_of(new_descriptor) == VERIFY_IMPLEMENTATION
+
     if not configuration_approved:
         state.revert(checkpoint)
         if prepayment:
@@ -726,7 +733,6 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
         state[tx.sender].code = new_descriptor
 
     if direct_path and len(configuration_data) > 4:
-        assert authority_type_of(new_descriptor) == VERIFY_IMPLEMENTATION
         # success = normal halt (STOP or RETURN)
         initialized = execute_new_verification_implementation(
             mode=CONFIGURE_MODE,
@@ -900,7 +906,7 @@ Public-mempool implementations MUST recognize the forms:
 [pre_configure, only_verify, pay]
 ```
 
-when `pre_configure` is directly evaluable: an inline-root descriptor replacement, a code-less-account installation, or an [EIP-7702](./eip-7702.md)-indicator installation, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation or existing account code remains profile-dependent (see below); such forms include the licensing configure-approving `VERIFY` frame, for example `[configure_verify, pre_configure, self_verify]`.
+when `pre_configure` is directly evaluable: an inline-root descriptor replacement, a code-less-account installation, or an [EIP-7702](./eip-7702.md)-indicator installation, each carrying no bootstrap initialization payload, alongside the existing optional expiry/deploy variants. Recognition of `pre_configure` forms whose configuration executes a verification implementation or existing account code remains profile-dependent (see below); such forms include the licensing configure-approving `VERIFY` frame, for example `[configure_verify, pre_configure, self_verify]`.
 
 A pre-payment configuration is evaluated on a temporary state overlay. Every later validation frame observes that overlay. The overlay is discarded if the transaction is rejected, replaced, evicted, becomes invalid, or fails to establish a payer.
 
