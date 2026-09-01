@@ -409,7 +409,7 @@ It succeeds only when:
 
 1. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`.
 2. `signature_index < len(tx.signatures)`.
-3. The referenced signature's `msg` is empty, or equals `compute_configure_hash(tx)` when the requested scope is exactly `APPROVE_CONFIGURE`.
+3. The referenced signature's `msg` is empty, or equals the configure hash of the first `CONFIGURE` frame following this frame when the requested scope is exactly `APPROVE_CONFIGURE`.
 4. The signature produces an `AuthenticationResult`.
 5. The result matches the descriptor's `(verifier, key_id)`.
 6. The frame requests a nonzero extended approval scope.
@@ -421,7 +421,7 @@ On success, protocol applies the same effects as:
 APPROVE(frame.flags & EXTENDED_APPROVE_SCOPE_MASK)
 ```
 
-No verification or execution implementation bytecode runs. The inline root is full account authority, so it may approve the `APPROVE_CONFIGURE` scope; a `CONFIGURE_HASH` signature licenses only that scope and never execution or payment.
+No verification or execution implementation bytecode runs. The inline root is full account authority, so it may approve the `APPROVE_CONFIGURE` scope. An empty-`msg` signature licenses every `CONFIGURE` frame; a `CONFIGURE_HASH` signature licenses only the configure scope, covers only its committed frame, and never approves execution or payment.
 
 ### Root configure licensing for code-less and delegated senders
 
@@ -429,11 +429,11 @@ No verification or execution implementation bytecode runs. The inline root is fu
 
 1. `len(frame.data) == ROOT_VERIFY_DATA_LENGTH`, containing one unsigned 32-bit big-endian signature index.
 2. The referenced signature is `SECP256K1` and its recovered address equals `tx.sender`.
-3. The signature's `msg` is empty, or equals `compute_configure_hash(tx)` when the requested scope is exactly `APPROVE_CONFIGURE`.
+3. The signature's `msg` is empty, or equals the configure hash of the first `CONFIGURE` frame following this frame when the requested scope is exactly `APPROVE_CONFIGURE`.
 4. On a delegation-indicator account, the requested scope is exactly `APPROVE_CONFIGURE`.
 5. Every ordinary [EIP-8141](./eip-8141.md) structural rule for the requested scope holds.
 
-On success, protocol applies the same effects as `APPROVE(frame.flags & EXTENDED_APPROVE_SCOPE_MASK)`. No default code, delegated code, or implementation bytecode runs.
+On success, protocol applies the same effects as `APPROVE(frame.flags & EXTENDED_APPROVE_SCOPE_MASK)`. An empty-`msg` signature licenses every `CONFIGURE` frame; a `CONFIGURE_HASH` signature covers only its committed frame. No default code, delegated code, or implementation bytecode runs.
 
 On a code-less account a canonical-hash signature MAY combine the configure scope with execution and payment: the account key already approves those through [EIP-8141](./eip-8141.md)'s default code, so there is no separate validation policy to bypass, and the combined frame is equivalent to the default-code approval plus configure licensing in one step. On a delegation-indicator account the root path is configure-only: execution and payment continue to flow exclusively through the delegate, so the root path never bypasses the delegate's validation policy. That configure-only bypass is deliberate: the account key already holds protocol-level root authority over the account's code through [EIP-7702](./eip-7702.md) re-delegation, and existing delegates predate the configure scope. A `VERIFY` frame without the configure bit is unaffected and follows existing [EIP-8141](./eip-8141.md) dispatch, including delegate execution.
 
@@ -445,11 +445,11 @@ The [EIP-8141](./eip-8141.md) `TXPARAM` table is extended with:
 |---|---|
 | `0x0D` | `compute_configure_hash(tx)` |
 
-`TXPARAM(TXPARAM_CONFIGURE_HASH)` results in an exceptional halt when the transaction contains no `CONFIGURE` frame. At most one `CONFIGURE` frame exists per transaction (structural rule 6 below), so the value is transaction-scoped.
+A transaction MAY contain multiple `CONFIGURE` frames; each has its own digest, parameterized by frame index. `TXPARAM(TXPARAM_CONFIGURE_HASH)` returns `compute_configure_hash(tx, i)` where `i` is the index of the first `CONFIGURE` frame at or after the current frame, and results in an exceptional halt when no such frame exists.
 
 ```python
-def compute_configure_hash(tx):
-    configure_index = unique_configure_frame_index(tx)
+def compute_configure_hash(tx, configure_index):
+    assert tx.frames[configure_index].mode == CONFIGURE
     return keccak256(
         CONFIGURE_HASH_DOMAIN
         + bytes([FRAME_TX_TYPE])
@@ -467,8 +467,8 @@ The digest commits to the complete `CONFIGURE` frame -- mode, flags, target, gas
 
 A configuration authority may therefore use either signature form:
 
-- `sig.msg` empty -- the signature commits to the complete canonical frame transaction; or
-- `sig.msg == compute_configure_hash(tx)` -- the signature authorizes only the configuration.
+- `sig.msg` empty -- the signature commits to the complete canonical frame transaction, every `CONFIGURE` frame included; or
+- `sig.msg == compute_configure_hash(tx, i)` -- the signature authorizes only the configuration at frame index `i`.
 
 A configuration-only signature MUST NOT be used to authorize execution or payment. On the protocol root-licensing paths this is protocol-enforced: a `CONFIGURE_HASH` signature may license only the `APPROVE_CONFIGURE` scope. A verification implementation MUST enforce it under its own policy, conceptually:
 
@@ -482,7 +482,7 @@ APPROVE(APPROVE_CONFIGURE)
 
 This proposal extends the [EIP-8141](./eip-8141.md) `APPROVE` instruction with the scope bit `APPROVE_CONFIGURE` (`0x8`), approvable only from `VERIFY` frames.
 
-Configuration authorization is thereby expressed where every other authorization already lives: the account's verification path, while it is authenticating credentials, decides whether this transaction may configure the account. The `CONFIGURE` frame itself never authorizes; it is a licensed mutation frame. Approval sets the transaction-scoped value `configure_approved`, initialized to false.
+Configuration authorization is thereby expressed where every other authorization already lives: the account's verification path, while it is authenticating credentials, decides whether this transaction may configure the account. The `CONFIGURE` frame itself never authorizes; it is a licensed mutation frame. Approval extends the transaction-scoped license `configure_license`, initialized to empty coverage.
 
 `APPROVE` is redefined as:
 
@@ -502,9 +502,7 @@ def approve(scope, offset, length):
             revert()
         if resolved_target != tx.sender:
             revert()
-        if configure_approved:
-            revert()
-        configure_approved = True
+        configure_license = ALL_CONFIGURE_FRAMES
     remaining = scope & APPROVE_SCOPE_MASK
     if remaining != 0:
         apply_existing_eip8141_approval_effects(remaining)
@@ -513,11 +511,19 @@ def approve(scope, offset, length):
 
 A `VERIFY` frame may approve `APPROVE_CONFIGURE` alone or combined with execution/payment bits in a single `APPROVE`. Existing `APPROVE_PAYMENT`, `APPROVE_EXECUTION`, and `APPROVE_EXECUTION_AND_PAYMENT` behavior is unchanged. Any `APPROVE` inside a `CONFIGURE` frame reverts.
 
-Because the approving code runs while the transaction's frame list is introspectable, a verification implementation SHOULD read the `CONFIGURE` frame's exact data through frame introspection before approving, and MUST bind its approval to that payload under its own authorization model.
+`configure_license` is coverage, not a single-use token:
+
+- an `APPROVE(APPROVE_CONFIGURE)` executed by account code licenses every `CONFIGURE` frame in the transaction -- the approving code inspects the actual frame list of the actual transaction, so its approval is an informed decision over all of it;
+- a protocol root path (inline-root verification, root licensing) backed by an empty-`msg` signature licenses every `CONFIGURE` frame -- the signature commits to the complete transaction; and
+- a protocol root path backed by a `CONFIGURE_HASH` signature licenses exactly the frame the digest commits: the first `CONFIGURE` frame following the licensing frame, whose digest MUST equal `sig.msg`.
+
+Coverage accumulates across licensing frames and is never consumed. A `CONFIGURE` frame at index `i` requires coverage of `i` at entry. Inserting, reordering, or altering a `CONFIGURE` frame breaks either the canonical transaction hash or the index-committed digest, so no configuration can execute outside what its licensor committed to.
+
+Because the approving code runs while the transaction's frame list is introspectable, a verification implementation SHOULD read every `CONFIGURE` frame's exact data through frame introspection before approving, and MUST bind its approval to those payloads under its own authorization model -- a code-path approval licenses all of them.
 
 Approving `APPROVE_CONFIGURE` does not require `payer` to be set. It does not set `sender_approved`, does not select or change `payer`, does not increment a nonce, and does not collect maximum cost.
 
-`configure_approved` joins [EIP-8141](./eip-8141.md)'s journaled approval context alongside `payer` and `sender_approved`: transaction initialization leaves all three unset, every rollback boundary that restores the approval context -- a reverted nested call, a failed or reverted frame, an unrolled atomic batch, or transaction failure -- restores `configure_approved` with it, and `CONFIGURE` frame entry consumes it (see below). In a combined approval such as `APPROVE(APPROVE_CONFIGURE | APPROVE_PAYMENT)`, a revert while applying the execution/payment effects rolls the configuration approval back with the call frame; a partially applied combined approval never survives.
+`configure_license` joins [EIP-8141](./eip-8141.md)'s journaled approval context alongside `payer` and `sender_approved`: transaction initialization leaves all three unset, and every rollback boundary that restores the approval context -- a reverted nested call, a failed or reverted frame, an unrolled atomic batch, or transaction failure -- restores `configure_license` with it. In a combined approval such as `APPROVE(APPROVE_CONFIGURE | APPROVE_PAYMENT)`, a revert while applying the execution/payment effects rolls the license back with the call frame; a partially applied combined approval never survives.
 
 If `payer == None` when the `CONFIGURE` frame begins, the configuration is a **pre-payment configuration** and belongs to the transaction's validation prefix. Its effects remain part of the transaction journal and are visible to later frames. They commit only if a later frame successfully establishes a payer and the transaction remains valid.
 
@@ -549,22 +555,23 @@ assert frame.flags < 16
 | `3` | `APPROVE_CONFIGURE` approval scope | `VERIFY` frames whose `resolved_target` is `tx.sender` |
 | `4+` | reserved | no frame |
 
-A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 7 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
+A `CONFIGURE` frame belonging to an atomic batch -- carrying the flag itself or preceded by a frame that carries it, per [EIP-8141](./eip-8141.md)'s membership rule -- requires `payer` to be set at frame entry (structural rule 6 below), preserving [EIP-8141](./eip-8141.md)'s rule that the validation prefix stays outside atomic batches.
 
 A `CONFIGURE` frame targets `tx.sender` and carries no value or execution/payment approval scope. It may execute before or after payer approval, and before or after `SENDER` frames.
 
-Every `CONFIGURE` frame MUST be preceded by a `VERIFY` frame that approved `APPROVE_CONFIGURE`, and `configure_approved` MUST be true at `CONFIGURE` frame entry. There are no exempt paths. Accounts whose authority is protocol-native -- inline-root, code-less, and delegation-indicator accounts -- obtain the approval through the root-licensing rules above, which verify the root-equivalent signature without executing code.
+Every `CONFIGURE` frame MUST be preceded by a `VERIFY` frame that approved `APPROVE_CONFIGURE`, and `configure_license` MUST cover the frame's index at entry. There are no exempt paths. Accounts whose authority is protocol-native -- inline-root, code-less, and delegation-indicator accounts -- obtain the approval through the root-licensing rules above, which verify the root-equivalent signature without executing code.
 
 ```text
-No CONFIGURE without a prior APPROVE_CONFIGURE.
-APPROVE_CONFIGURE is always produced under the pre-configuration authority.
+No CONFIGURE without a prior APPROVE_CONFIGURE covering it.
+APPROVE_CONFIGURE is always produced under authority established
+before the configuration it licenses.
 CONFIGURE mutates authentication state or the descriptor.
 Every later VERIFY observes the post-configuration authority.
 ```
 
 The licensing `VERIFY` frame MAY be the same frame that approves execution and payment -- one `APPROVE` with combined scope -- or a configure-only `VERIFY` frame, before or after payer approval. A root-licensing frame on a delegated account is always configure-only; on a code-less account it may combine scopes under a canonical-hash signature. The same canonical-hash signature entry may support the licensing frame and any other frame: the protocol validates each entry once, and code in any frame reads its authenticated result through `SIGPARAM`, so composing the modes duplicates no witness and repeats no cryptographic verification. Later validation frames observe the configuration's effects, so a pre-payment licensing `VERIFY` plus `CONFIGURE` ahead of the remaining validation frames is the install-and-first-use construction.
 
-A `CONFIGURE` frame never authorizes itself and never inherits authority from `sender_approved` or `payer` state; only `configure_approved` licenses it.
+A `CONFIGURE` frame never authorizes itself and never inherits authority from `sender_approved` or `payer` state; only `configure_license` coverage licenses it.
 
 Its data is:
 
@@ -583,14 +590,13 @@ The frame is structurally valid only when:
 3. no flag bit that the flag-validity table does not permit for the frame's mode is set.
 4. `frame.value == 0`.
 5. a nonzero `new_descriptor_length` fits within `frame.data` and the selected bytes parse under an active authority type.
-6. at most one `CONFIGURE` frame appears in the transaction.
-7. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
-8. an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
-9. if the current account is inline-root, code-less, or carries a delegation indicator, `configuration_data` is nonempty only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
+6. if `payer == None` at frame entry, the frame does not belong to an atomic batch: neither it nor its immediate predecessor carries `ATOMIC_BATCH_FLAG`.
+7. an earlier `VERIFY` frame carrying the `APPROVE_CONFIGURE` flag bit and targeting `tx.sender` precedes it.
+8. if the current account is inline-root, code-less, or carries a delegation indicator, `configuration_data` is nonempty only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor.
 
 At frame entry, clients create a state checkpoint covering all account, storage, call, log, and descriptor effects of the frame.
 
-Every `CONFIGURE` frame requires `configure_approved == true` at entry and consumes it: frame entry sets `configure_approved` back to false as a journaled effect of the frame, so the license is single-use. Every executed configuration or bootstrap-initialization code path succeeds when it halts normally (`STOP` or `RETURN`); a revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint, restoring `configure_approved` with the rest of the approval context. The protocol installation paths install without executing current-account code.
+Every `CONFIGURE` frame requires `configure_license` coverage of its frame index at entry. Every executed configuration or bootstrap-initialization code path succeeds when it halts normally (`STOP` or `RETURN`); a revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint. The protocol installation paths install without executing current-account code.
 
 - If the frame began before payer approval, any configuration failure, revert, or exceptional halt makes the frame transaction invalid.
 - If the frame began after payer approval, configuration failure produces a failed paid frame and the transaction may continue under ordinary frame semantics.
@@ -651,7 +657,7 @@ If `tx.sender` is not yet structured, the installation path depends on the accou
 
 On each protocol installation path -- an inline-root, code-less, or delegation-indicator account -- any `configuration_data` bytes form an OPTIONAL bootstrap initialization payload.
 
-A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 9 above). After the descriptor is installed, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor.
+A nonempty payload is valid only when the new descriptor is a `VERIFY_IMPLEMENTATION` descriptor; combined with an `INLINE_ROOT` descriptor the frame is structurally invalid (structural rule 8 above). After the descriptor is installed, the newly installed verification implementation executes in the non-static configuration context of the authority-state-update table above, with two differences: the code source and nested self-call dispatch are the newly installed `verification_implementation`, and `EXTCODE*` of `ADDRESS` observes the newly installed descriptor. Calldata is the complete `frame.data`, unchanged; the implementation locates its payload after the descriptor.
 
 The frame succeeds when the initialization code halts normally. A revert or exceptional halt is a configuration failure and rolls back to the frame-entry checkpoint, including the descriptor installation.
 
@@ -678,8 +684,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     assert frame.flags & APPROVE_SCOPE_MASK == 0
     assert frame.flags & APPROVE_CONFIGURE == 0
     assert frame.value == 0
-    assert configure_approved  # structural rule 8's runtime counterpart
-    configure_approved = False  # consume; journaled with the frame
+    assert configure_license_covers(frame.index)  # rule 7's runtime counterpart
 
     prepayment = payer is None
     if prepayment:
@@ -706,7 +711,7 @@ def execute_structured_configure(frame, current_descriptor, tx, state):
     if protocol_install:
         assert new_descriptor is not None
         if len(configuration_data) != 0:
-            # structural rule 9: bootstrap payload
+            # structural rule 8: bootstrap payload
             assert authority_type_of(new_descriptor) == VERIFY_IMPLEMENTATION
         configuration_approved = True
 
@@ -985,7 +990,7 @@ The DoS concern is addressed by validation gas/state bounds and recognized profi
 
 An earlier draft prohibited any `SENDER` frame before `CONFIGURE`. Under uniform licensing the restriction lost its justification: the license is produced by an earlier `VERIFY` under the pre-configuration authority and commits to the exact configuration payload, so business execution running in between cannot change what was authorized -- only the state the licensed configuration code operates on, which that code already owns defensively. A `CONFIGURE` following a `SENDER` frame is post-payment by construction, so it is ordinary paid execution outside the validation prefix and adds no mempool work.
 
-The ordering enables a third bootstrap route: initialize authority state through ordinary execution -- deploy a verification implementation, initialize a per-account authority contract, write keystore entries -- and switch the descriptor in a final `CONFIGURE` frame, all in one transaction. The invariants are unaffected: at most one `CONFIGURE` exists, its licensing `VERIFY` still precedes it, and the authority approving the transaction's own execution was established before any `SENDER` frame ran.
+The ordering enables a third bootstrap route: initialize authority state through ordinary execution -- deploy a verification implementation, initialize a per-account authority contract, write keystore entries -- and switch the descriptor in a final `CONFIGURE` frame, all in one transaction. The invariants are unaffected: every `CONFIGURE` is covered by a license from an earlier `VERIFY`, and the authority approving the transaction's own execution was established before any `SENDER` frame ran.
 
 ### Why every configuration is licensed from a `VERIFY` frame
 
@@ -1105,7 +1110,7 @@ Implementations MUST cover at least the following cases.
 
 1. `CONFIGURE_HASH` differs across chain IDs, senders, nonces, `CONFIGURE` frame positions, and any descriptor or configuration-payload change.
 2. `CONFIGURE_HASH` is unchanged when only fees or unrelated frames change.
-3. `TXPARAM(0x0D)` halts when the transaction has no `CONFIGURE` frame.
+3. `TXPARAM(0x0D)` halts when no `CONFIGURE` frame exists at or after the current frame, and returns the first following `CONFIGURE` frame's digest otherwise; distinct `CONFIGURE` frames in one transaction produce distinct digests.
 4. A `CONFIGURE_HASH` signature licenses a configure-only root-licensing `VERIFY` frame on inline-root, code-less, and delegation-indicator accounts, and cannot approve execution or payment.
 5. A canonical transaction signature may authorize configuration combined with execution/payment scopes.
 
@@ -1114,15 +1119,15 @@ Implementations MUST cover at least the following cases.
 1. Approve `APPROVE_CONFIGURE` from a `VERIFY` frame targeting `tx.sender`, alone and combined with execution/payment scope in one `APPROVE`, before and after payer approval.
 2. Reject the `APPROVE_CONFIGURE` scope bit in `DEFAULT` and `SENDER` modes and when `resolved_target != tx.sender`.
 3. Reject any `APPROVE` inside a `CONFIGURE` frame.
-4. Reject a second `APPROVE_CONFIGURE` when `configure_approved` is already set.
+4. Accumulate coverage across multiple licensing `VERIFY` frames; confirm a `CONFIGURE_HASH`-backed root license covers only its committed frame while a code-path or empty-`msg` license covers every `CONFIGURE` frame.
 5. Confirm approving `APPROVE_CONFIGURE` does not alter `sender_approved`, payer, nonce, or maximum-cost collection.
 6. Reject any `CONFIGURE` frame with no preceding configure-approving `VERIFY` frame, on every path including protocol installation.
 7. Confirm a licensed `CONFIGURE` frame succeeds on normal halt, and rolls back all configuration state changes on revert or exceptional halt.
 8. Reject a pre-payment configuration that carries `ATOMIC_BATCH_FLAG` or terminates an atomic batch begun by its predecessor.
-9. Roll back `configure_approved` when a combined `APPROVE` fails its payment effects, when the approving frame reverts, and when an atomic batch unrolls.
+9. Roll back `configure_license` when a combined `APPROVE` fails its payment effects, when the approving frame reverts, and when an atomic batch unrolls.
 10. Approve `APPROVE_CONFIGURE` through a root-licensing `VERIFY` frame on a code-less and on a delegation-indicator account; reject a non-account-key signature; confirm neither default nor delegate code executes.
 11. Approve combined execution, payment, and configure scope through a code-less root-licensing frame under a canonical-hash signature; reject the combined scope on a delegation-indicator account and under a `CONFIGURE_HASH` signature.
-12. Confirm `CONFIGURE` frame entry consumes `configure_approved`, and a rolled-back `CONFIGURE` frame restores it with the approval context.
+12. Execute two `CONFIGURE` frames under one canonical-hash license, each licensed mutation applying in order; reject a second `CONFIGURE` frame outside a `CONFIGURE_HASH` license's committed frame.
 
 ### Pre-payment configuration
 
@@ -1230,9 +1235,9 @@ Installing a stateful verification implementation without initialized authority 
 
 ### Execution approval is not configuration authority
 
-[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority would let such a credential replace the account's code and seize root authority. No installation or configuration path therefore consults `sender_approved`: every path requires the separate `configure_approved` value, established only from a `VERIFY` frame -- by account code approving in the account's own context, or by protocol root licensing verifying a root-equivalent signature.
+[EIP-8141](./eip-8141.md) `APPROVE_EXECUTION` permits later frames to call on the account's behalf; a wallet may grant it to restricted credentials such as session keys. Accepting `sender_approved` as installation authority would let such a credential replace the account's code and seize root authority. No installation or configuration path therefore consults `sender_approved`: every path requires separate `configure_license` coverage, established only from a `VERIFY` frame -- by account code approving in the account's own context, or by protocol root licensing verifying a root-equivalent signature.
 
-The same rule applies inside verification implementations. Code deciding whether to approve `APPROVE_CONFIGURE` MUST derive that decision from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority. It MUST bind the approval to the exact `CONFIGURE` frame payload, which it can read through frame introspection before approving.
+The same rule applies inside verification implementations. Code deciding whether to approve `APPROVE_CONFIGURE` MUST derive that decision from authenticated signature entries and its own policy, never from `sender_approved`, `payer`, or the success of earlier frames: those may reflect a restricted credential that holds execution authority but not configuration authority. It MUST bind the approval to the exact payload of every `CONFIGURE` frame it licenses, which it can read through frame introspection before approving.
 
 ### Descriptor installation discards prior code
 
